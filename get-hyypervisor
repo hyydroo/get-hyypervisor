@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+# get-hyypervisor – installiert und aktualisiert alle Bauteile von hyypervisor als systemd-Dienste (ohne Docker).
+# Debian 12/13 oder Ubuntu 22.04+, als root.
+#
+#   get-hyypervisor [install]           fragt, was installiert werden soll (ein Bauteil oder eine Kombination)
+#   get-hyypervisor install portal      hyypervisor  – Portal (Weboberfläche + Verwaltung)
+#   get-hyypervisor install node        hyyper-node  – Gameserver-Host (rootless Podman)
+#   get-hyypervisor install forwarder   hyyper-forwarder – Port-Weiterleitung zu den Nodes
+#   get-hyypervisor install all         Portal + Node auf dieser einen VM
+#   get-hyypervisor install portal node forwarder   mehrere Bauteile in einem Lauf (Reihenfolge egal)
+#   get-hyypervisor update [Bauteil]    Bauteile aktualisieren (ohne Angabe: alles, was hier installiert ist)
+#   get-hyypervisor uninstall <Bauteil> Dienst entfernen (Daten bleiben)
+#   get-hyypervisor status              installierte Bauteile und Versionen
+#   get-hyypervisor backup-dir <DIR|off>  Fremdspeicher für Snapshot-Kopien des Nodes setzen/abschalten (z. B. NFS-Einhängepunkt)
+#
+# Optionen portal/all: --image REF  --binary FILE  --listen ADDR  --db URL  --proxies CIDR
+# Optionen node:       --portal URL  --token T (oder HYY_JOIN_TOKEN=…, oder Eingabe)  --data DIR  --backup-dir DIR  --allow CIDR  --no-firewall  --registry-login HOST
+#
+# Das Portal liefert dieses Skript selbst aus: curl -fsSL http://<portal>/get-hyypervisor | sudo bash
+set -euo pipefail
+
+PORTAL_DEFAULT="__PORTAL_URL__"          # vom Portal beim Ausliefern eingesetzt
+[[ "$PORTAL_DEFAULT" == __* ]] && PORTAL_DEFAULT=""
+
+ACTION=""; COMP=""; COMPS=()
+IMAGE="ghcr.io/hyydroo/hyypervisor:latest"; BINARY=""; LISTEN=":8080"; DB=""; PROXIES=""
+PORTAL_URL="$PORTAL_DEFAULT"; TOKEN=""; NODE_DATA=""; BACKUP_DIR=""; FIREWALL=1; ALLOW=(); REGISTRY=""
+ARGS_GIVEN=0
+
+PORTAL_USER="hyypervisor"; PORTAL_DATA="/var/lib/hyypervisor"; PORTAL_ENV_DIR="/etc/hyypervisor"
+NODE_USER="hyyper"; NODE_ENV_DIR="/etc/hyyper-node"; NODE_DEFAULT_DATA="/var/lib/hyyper-node"
+BIN="/usr/local/bin/hyypervisor"; SELF="/usr/local/bin/get-hyypervisor"
+
+say() { printf '\033[36m[get-hyypervisor]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[get-hyypervisor] Fehler:\033[0m %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,19p' "$0" 2>/dev/null || true; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    install|update|uninstall|status) ACTION="$1"; shift ;;
+    backup-dir) ACTION="backup-dir"; shift; if [[ $# -gt 0 && "$1" != -* ]]; then BACKUP_DIR="$1"; shift; fi ;;
+    portal|node|forwarder) COMP="$1"; COMPS+=("$1"); shift ;;
+    all) COMP="all"; COMPS+=(portal node); shift ;;
+    agent) COMP="node"; COMPS+=(node); shift ;;
+    --image) IMAGE="$2"; ARGS_GIVEN=1; shift 2 ;;
+    --binary) BINARY="$2"; shift 2 ;;
+    --listen) LISTEN="$2"; shift 2 ;;
+    --db) DB="$2"; shift 2 ;;
+    --proxies) PROXIES="$2"; shift 2 ;;
+    --portal) PORTAL_URL="${2%/}"; shift 2 ;;
+    --token) TOKEN="$2"; shift 2 ;;
+    --data) NODE_DATA="$2"; shift 2 ;;
+    --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
+    --allow) ALLOW+=("$2"); shift 2 ;;
+    --no-firewall) FIREWALL=0; shift ;;
+    --registry-login) REGISTRY="$2"; shift 2 ;;
+    --mode) COMP="$2"; [[ "$COMP" == agent ]] && COMP=node; if [[ "$COMP" == all ]]; then COMPS+=(portal node); else COMPS+=("$COMP"); fi; [[ -n "$ACTION" ]] || ACTION=install; shift 2 ;;   # alte Schreibweise
+    --uninstall) ACTION="uninstall"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unbekannte Option: $1 (siehe --help)" ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || die "Bitte mit root/sudo ausführen."
+# Beitritts-Token lieber nicht als Argument (sichtbar in der Prozessliste): HYY_JOIN_TOKEN=… oder Eingabe am Prompt.
+[[ -n "$TOKEN" ]] || TOKEN="${HYY_JOIN_TOKEN:-}"
+unset HYY_JOIN_TOKEN
+
+# Alter Aufruf über das Portal-Skript: "--token" ohne Bauteil heißt Node installieren.
+[[ -z "$ACTION" && -z "$COMP" && -n "$TOKEN" ]] && { ACTION=install; COMP=node; COMPS=(node); }
+
+# Skript und Binary werden als root ausgeführt: nur über HTTPS oder aus privaten/Loopback-Netzen laden (HYY_ALLOW_INSECURE=1 hebt das auf).
+require_secure() {
+  local url="$1" host
+  [[ "$url" == https://* ]] && return 0
+  host=$(echo "$url" | sed -E 's#^https?://([^/:]+).*#\1#')
+  [[ "${HYY_ALLOW_INSECURE:-}" == 1 ]] && return 0
+  if [[ "$host" =~ ^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]] || [[ "$host" == *.local || "$host" == *.lan || "$host" == *.internal ]]; then return 0; fi
+  die "Portal-Adresse $url ist unverschlüsselt und nicht privat. Skript und Binary laufen als root – bitte https:// verwenden (oder HYY_ALLOW_INSECURE=1 setzen, wenn du das Risiko kennst)."
+}
+# Ein heruntergeladenes Skript muss wie get-hyypervisor aussehen und fehlerfrei parsen, bevor es installiert wird.
+install_script_file() {
+  local f="$1"
+  head -1 "$f" | grep -q '^#!/usr/bin/env bash' && grep -q '^# get-hyypervisor' "$f" && bash -n "$f" 2>/dev/null || return 1
+  install -m 755 "$f" "$SELF"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+unit_exists() { [[ -f "/etc/systemd/system/$1.service" ]]; }
+installed_version() { [[ -x "$BIN" ]] && "$BIN" version 2>/dev/null | awk '{print $2}' || echo "-"; }
+
+apt_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq "$@" >/dev/null
+}
+
+# Das Skript auf diese VM legen, damit "get-hyypervisor update" später funktioniert.
+# Nur die eigene, geprüfte Datei oder das Portal-Skript (HTTPS/privat) – nie ein beliebiger Pfad.
+install_self() {
+  local src="${BASH_SOURCE[0]:-}" tmp url
+  if [[ "$src" == "$SELF" ]]; then return 0; fi
+  if [[ -n "$src" && -f "$src" && "$(basename "$src")" == get-hyypervisor ]] && install_script_file "$src"; then return 0; fi
+  url="${PORTAL_URL:-$PORTAL_DEFAULT}"
+  if [[ -n "$url" && ! -f "$SELF" ]]; then
+    require_secure "$url"
+    tmp=$(mktemp); curl -fsSL "$url/get-hyypervisor" -o "$tmp" && install_script_file "$tmp" || say "Hinweis: get-hyypervisor konnte nicht auf diese VM gelegt werden."
+    rm -f "$tmp"
+  fi
+}
+refresh_self_from_binary() { local f; f=$(mktemp); if [[ -x "$BIN" ]] && "$BIN" script > "$f" 2>/dev/null; then install_script_file "$f" || true; fi; rm -f "$f"; }
+
+# ---- Menü ------------------------------------------------------------------------------------------
+menu() {
+  [[ -r /dev/tty ]] || die "Keine Eingabe möglich – Bauteil angeben: get-hyypervisor install portal|node|forwarder (mehrere möglich)"
+  cat >/dev/tty <<EOF
+
+  Was soll auf dieser VM installiert werden?
+
+    1) Nur hyypervisor            Portal: Weboberfläche und Verwaltung
+    2) Nur hyyper-node            Gameserver-Host: führt die Spielserver aus
+    3) Nur hyyper-forwarder       Port-Weiterleitung zu den Nodes
+    4) hyypervisor + hyyper-node  kleine Installation auf einer VM
+    5) hyypervisor + hyyper-forwarder
+    6) hyypervisor + hyyper-node + hyyper-forwarder   alles auf einer VM
+    7) hyyper-node + hyyper-forwarder
+    8) Abbrechen
+
+EOF
+  local a; read -r -p "  Auswahl [1-8]: " a </dev/tty
+  case "$a" in
+    1) COMPS=(portal) ;;
+    2) COMPS=(node) ;;
+    3) COMPS=(forwarder) ;;
+    4) COMPS=(portal node) ;;
+    5) COMPS=(portal forwarder) ;;
+    6) COMPS=(portal node forwarder) ;;
+    7) COMPS=(node forwarder) ;;
+    *) exit 0 ;;
+  esac
+  COMP="${COMPS[0]}"
+  ACTION=install
+}
+
+ask() { # ask VAR "Frage" [secret]
+  local var="$1" q="$2" v=""
+  [[ -r /dev/tty ]] || die "$q fehlt (Option angeben)."
+  if [[ "${3:-}" == secret ]]; then read -r -s -p "  $q: " v </dev/tty; echo; else read -r -p "  $q: " v </dev/tty; fi
+  printf -v "$var" '%s' "$v"
+}
+
+# ---- Portal ------------------------------------------------------------------------------------------
+fetch_portal_binary() {
+  local tmp="$1" logged_in=0
+  if [[ -n "$BINARY" ]]; then
+    [[ -f "$BINARY" ]] || die "Binary $BINARY nicht gefunden."
+    cp "$BINARY" "$tmp"; return
+  fi
+  have podman || apt_install podman
+  if [[ -n "${GHCR_USER:-}" && -n "${GHCR_TOKEN:-}" ]]; then
+    say "Melde mich bei ghcr.io an …"
+    printf '%s' "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null || die "Anmeldung an ghcr.io fehlgeschlagen."
+    logged_in=1
+  fi
+  say "Hole Binary aus $IMAGE …"
+  if ! podman pull -q "$IMAGE" >/dev/null 2>&1; then
+    # Ist das Image privat, nach einem GitHub-Zugang fragen (Leserecht auf Pakete genügt), sofern ein Terminal da ist.
+    if [[ $logged_in -eq 0 ]] && (exec </dev/tty) 2>/dev/null; then
+      say "Das Image ist nicht öffentlich. GitHub-Zugang mit Leserecht auf Pakete (read:packages) eingeben:"
+      ask GHCR_USER "GitHub-Benutzername"
+      ask GHCR_TOKEN "Token (read:packages)" secret
+      [[ -n "$GHCR_USER" && -n "$GHCR_TOKEN" ]] || die "Benutzername und Token dürfen nicht leer sein."
+      printf '%s' "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null || die "Anmeldung an ghcr.io fehlgeschlagen."
+      logged_in=1
+    fi
+    podman pull -q "$IMAGE" >/dev/null || die "Image nicht ladbar (privat? dann GHCR_USER/GHCR_TOKEN setzen oder 'podman login ghcr.io')."
+  fi
+  local cid; cid=$(podman create "$IMAGE")
+  podman cp "$cid:/usr/local/bin/hyypervisor" "$tmp"
+  podman rm "$cid" >/dev/null
+  # Der Zugang wird nur für den Download gebraucht: wieder abmelden, damit er nicht auf der VM liegen bleibt.
+  if [[ $logged_in -eq 1 ]]; then podman logout ghcr.io >/dev/null 2>&1 || true; fi
+}
+
+install_portal() {
+  say "Installiere Portal (hyypervisor) …"
+  PKGS=(curl ca-certificates openssl); [[ -n "$BINARY" ]] || PKGS+=(podman)
+  apt_install "${PKGS[@]}"
+  if ! id "$PORTAL_USER" >/dev/null 2>&1; then
+    useradd --system --home-dir "$PORTAL_DATA" --create-home --shell /usr/sbin/nologin "$PORTAL_USER"
+  fi
+  mkdir -p "$PORTAL_DATA" "$PORTAL_ENV_DIR"
+  chown "$PORTAL_USER:$PORTAL_USER" "$PORTAL_DATA"; chmod 750 "$PORTAL_DATA"
+
+  local tmp; tmp=$(mktemp)
+  fetch_portal_binary "$tmp"
+  install -m 755 "$tmp" "$BIN"; rm -f "$tmp"
+  say "Version: $(installed_version)"
+  # Image merken, damit "update" dieselbe Quelle nutzt
+  printf 'IMAGE=%s\n' "$IMAGE" > "$PORTAL_ENV_DIR/install.conf"
+
+  local envf="$PORTAL_ENV_DIR/portal.env"
+  if [[ -f "$envf" ]]; then
+    say "Vorhandene Konfiguration bleibt erhalten ($envf)."
+  else
+    umask 077
+    cat > "$envf" <<EOF
+# hyypervisor-Portal – Umgebung (geheim halten, HYY_SECRET nie ändern)
+HYY_SECRET=$(openssl rand -hex 32)
+HYY_LISTEN=$LISTEN
+HYY_DB=${DB:-sqlite://$PORTAL_DATA/hyypervisor.db}
+HYY_TRUSTED_PROXIES=$PROXIES
+EOF
+    umask 022
+  fi
+  chown root:"$PORTAL_USER" "$envf"; chmod 640 "$envf"
+
+  cat > /etc/systemd/system/hyypervisor.service <<EOF
+[Unit]
+Description=hyypervisor (Portal)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$PORTAL_USER
+EnvironmentFile=$envf
+WorkingDirectory=$PORTAL_DATA
+ExecStart=$BIN serve
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=$PORTAL_DATA
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable hyypervisor.service >/dev/null
+  local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+  systemctl restart hyypervisor.service
+  # Läuft hier ein Node, nutzt er dasselbe Binary: mit neu starten (Spielserver-Container bleiben bestehen).
+  if unit_exists hyyper-node; then systemctl restart hyyper-node.service; say "hyyper-node auf dieser VM neu gestartet."; fi
+  if unit_exists hyyper-forwarder; then systemctl restart hyyper-forwarder.service; say "hyyper-forwarder auf dieser VM neu gestartet."; fi
+
+  local port; port=$(sed -n 's/^HYY_LISTEN=//p' "$envf"); port="${port##*:}"
+  say "Warte auf das Portal …"
+  for _ in $(seq 1 30); do curl -fsS "http://127.0.0.1:$port/api/v1/info" >/dev/null 2>&1 && break; sleep 1; done
+  curl -fsS "http://127.0.0.1:$port/api/v1/info" >/dev/null 2>&1 || die "Portal startet nicht. Log: journalctl -u hyypervisor -e"
+  local code ip
+  code=$(journalctl -u hyypervisor --since "$ts" --no-pager -o cat 2>/dev/null | sed -n 's/.*Setup-Code.*code=\([A-Za-z0-9-]*\).*/\1/p' | tail -1)
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  say "Portal läuft: http://${ip:-<VM-IP>}:$port"
+  if [[ -n "$code" ]]; then say "Setup-Code für den Assistenten: $code"; else say "Einrichtung bereits abgeschlossen (kein Setup-Code)."; fi
+  say "Logs: journalctl -u hyypervisor -f"
+  PORTAL_LOCAL_PORT="$port"
+}
+
+# ---- Node ----------------------------------------------------------------------------------------------
+# Fremdspeicher für Snapshot-Kopien: absoluter Pfad, existiert, der Node-Benutzer darf schreiben (bei NFS: Rechte/UID-Zuordnung).
+check_backup_dir() {
+  local d="$1"
+  [[ "$d" =~ ^/[A-Za-z0-9._/@+-]+$ && "$d" != *..* ]] || die "Ungültiger Fremdspeicher-Pfad: nur absolute Pfade ohne Leer- und Sonderzeichen."
+  [[ "$d" != "/" ]] || die "Ungültiger Fremdspeicher-Pfad."
+  [[ -d "$d" ]] || die "Fremdspeicher-Ordner $d existiert nicht. Erst einhängen (z. B. NFS in /etc/fstab), dann erneut versuchen."
+  runuser -u "$NODE_USER" -- test -w "$d" || die "Der Benutzer $NODE_USER darf in $d nicht schreiben (Rechte bzw. NFS-Benutzerzuordnung prüfen)."
+  if ! mountpoint -q "$d" 2>/dev/null; then say "Hinweis: $d ist kein eigener Einhängepunkt – liegt die Kopie dann auf derselben Platte wie die Snapshots?"; fi
+}
+
+node_env() { [[ -f "$NODE_ENV_DIR/node.env" ]] && sed -n "s/^$1=//p" "$NODE_ENV_DIR/node.env" | head -1 || true; }
+
+fetch_node_binary() { # fetch_node_binary <portal> <token>
+  case "$(uname -m)" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; *) die "Architektur $(uname -m) wird nicht unterstützt." ;; esac
+  local tmp; tmp=$(mktemp)
+  curl -fsSL -H "Authorization: Bearer $2" "$1/api/agent/download?arch=$ARCH" -o "$tmp" || { rm -f "$tmp"; die "Download vom Portal fehlgeschlagen (Token/Adresse prüfen)."; }
+  install -m 755 "$tmp" "$BIN"; rm -f "$tmp"
+}
+
+install_node() {
+  unit_exists hyyper-agent && die "Alter Dienst hyyper-agent gefunden. Erst entfernen: systemctl disable --now hyyper-agent hyyper-firewall; rm /etc/systemd/system/hyyper-agent.service /etc/systemd/system/hyyper-firewall.service. Serverdaten (/var/lib/hyyper-agent) mit --data /var/lib/hyyper-agent weiterverwenden."
+  [[ -n "$PORTAL_URL" ]] || ask PORTAL_URL "Adresse des Portals (z. B. http://10.0.0.5:8080)"
+  PORTAL_URL="${PORTAL_URL%/}"
+  [[ "$PORTAL_URL" == http* ]] || die "Portal-Adresse muss mit http:// oder https:// beginnen."
+  require_secure "$PORTAL_URL"
+  [[ "$PORTAL_URL" == https://* ]] || say "Achtung: Portal ohne HTTPS – nur im LAN/Test verwenden."
+  [[ -n "$TOKEN" ]] || ask TOKEN "Beitritts-Token (Portal → Nodes → Node anlegen)" secret
+  [[ -n "$TOKEN" ]] || die "Beitritts-Token fehlt."
+  local data="${NODE_DATA:-$NODE_DEFAULT_DATA}"
+
+  say "Installiere Node (hyyper-node) …"
+  apt_install podman uidmap passt nftables curl ca-certificates
+  [[ -f /sys/fs/cgroup/cgroup.controllers ]] || die "cgroups v2 nicht aktiv."
+
+  if ! id "$NODE_USER" >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir "$data" --shell /usr/sbin/nologin "$NODE_USER"
+  fi
+  mkdir -p "$data/servers"; chown -R "$NODE_USER:$NODE_USER" "$data"; chmod 750 "$data"
+  grep -q "^$NODE_USER:" /etc/subuid || usermod --add-subuids 200000-265535 "$NODE_USER"
+  grep -q "^$NODE_USER:" /etc/subgid || usermod --add-subgids 200000-265535 "$NODE_USER"
+  local uid; uid=$(id -u "$NODE_USER")
+  loginctl enable-linger "$NODE_USER"
+  systemctl start "user@$uid.service"
+  for _ in $(seq 1 20); do [[ -d "/run/user/$uid" ]] && break; sleep 0.5; done
+  mkdir -p /etc/systemd/system/user@.service.d
+  cat > /etc/systemd/system/user@.service.d/hyyper-delegate.conf <<'EOF'
+[Service]
+Delegate=cpu cpuset io memory pids
+EOF
+  systemctl daemon-reload
+  systemctl --user -M "$NODE_USER@" enable --now podman.socket >/dev/null
+  local socket="/run/user/$uid/podman/podman.sock"
+  [[ -z "$BACKUP_DIR" ]] || check_backup_dir "$BACKUP_DIR"
+
+  if [[ -n "$REGISTRY" ]]; then
+    [[ "$REGISTRY" =~ ^[A-Za-z0-9.:_-]+$ ]] || die "Ungültiger Registry-Name."
+    local ru="${REGISTRY_USER:-}" rt="${REGISTRY_TOKEN:-}"
+    [[ -n "$ru" ]] || ask ru "Benutzername für $REGISTRY"
+    [[ -n "$rt" ]] || ask rt "Token/Passwort für $REGISTRY" secret
+    [[ -n "$ru" && -n "$rt" ]] || die "Benutzername und Token dürfen nicht leer sein."
+    local adir="$data/.config/containers"
+    install -d -m 700 -o "$NODE_USER" -g "$NODE_USER" "$data/.config" "$adir"
+    printf '%s' "$rt" | runuser -u "$NODE_USER" -- env HOME="$data" XDG_RUNTIME_DIR="/run/user/$uid" \
+      podman login "$REGISTRY" -u "$ru" --password-stdin --authfile "$adir/auth.json" >/dev/null \
+      || die "Anmeldung an $REGISTRY fehlgeschlagen."
+    chmod 600 "$adir/auth.json"; say "Registry-Anmeldung für $REGISTRY gespeichert."
+  fi
+
+  say "Lade hyyper-node vom Portal …"
+  fetch_node_binary "$PORTAL_URL" "$TOKEN"
+  say "Version: $(installed_version)"
+  say "Melde Node beim Portal an …"
+  local enroll node_token
+  enroll=$(curl -fsS -X POST -H "Authorization: Bearer $TOKEN" "$PORTAL_URL/api/agent/enroll") \
+    || die "Beitritt abgelehnt – Token abgelaufen oder schon benutzt? Im Portal einen neuen Beitritts-Token erzeugen."
+  node_token=$(printf '%s' "$enroll" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  [[ "$node_token" == hyy_* ]] || die "Unerwartete Antwort vom Portal."
+
+  mkdir -p "$NODE_ENV_DIR"; umask 077
+  cat > "$NODE_ENV_DIR/node.env" <<EOF
+# hyyper-node – Verbindung zum Portal (Token geheim halten)
+HYY_PORTAL_URL=$PORTAL_URL
+HYY_NODE_TOKEN=$node_token
+HYY_NODE_DATA=$data
+${BACKUP_DIR:+HYY_NODE_BACKUP_DIR=$BACKUP_DIR
+}HYY_ENGINE_SOCKET=$socket
+XDG_RUNTIME_DIR=/run/user/$uid
+EOF
+  umask 022
+  chown root:"$NODE_USER" "$NODE_ENV_DIR/node.env"; chmod 640 "$NODE_ENV_DIR/node.env"
+
+  cat > /etc/systemd/system/hyyper-node.service <<EOF
+[Unit]
+Description=hyyper-node (hyypervisor Gameserver-Node)
+After=network-online.target user@$uid.service
+Wants=network-online.target user@$uid.service
+
+[Service]
+User=$NODE_USER
+EnvironmentFile=$NODE_ENV_DIR/node.env
+ExecStart=$BIN node
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=$data /run/user/$uid${BACKUP_DIR:+ $BACKUP_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  if [[ $FIREWALL -eq 1 ]]; then
+    local allow=""
+    for c in "${ALLOW[@]}"; do allow+="    ip daddr $c accept"$'\n'; done
+    local phost ip ns
+    phost=$(echo "$PORTAL_URL" | sed -E 's#^https?://([^/:]+).*#\1#')
+    for ip in $(getent ahostsv4 "$phost" | awk '{print $1}' | sort -u); do allow+="    ip daddr $ip meta l4proto tcp accept"$'\n'; done
+    for ns in $(awk '/^nameserver/ {print $2}' /etc/resolv.conf | grep -E '^[0-9.]+$' || true); do
+      allow+="    ip daddr $ns meta l4proto { tcp, udp } th dport 53 accept"$'\n'
+    done
+    cat > "$NODE_ENV_DIR/firewall.nft" <<EOF
+table inet hyyper
+delete table inet hyyper
+table inet hyyper {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    meta skuid != $uid accept
+    ct state established,related accept
+    oif lo accept
+$allow    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop
+    ip6 daddr { fc00::/7, fe80::/10 } drop
+  }
+}
+EOF
+    cat > /etc/systemd/system/hyyper-firewall.service <<EOF
+[Unit]
+Description=hyyper-node Firewall (Gameserver ohne Zugriff auf private Netze)
+Before=hyyper-node.service
+After=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/sbin/nft -f $NODE_ENV_DIR/firewall.nft
+ExecStop=/usr/sbin/nft delete table inet hyyper
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now hyyper-firewall.service >/dev/null
+    say "Firewall aktiv (Ausnahmen mit --allow CIDR)."
+  fi
+
+  systemctl daemon-reload
+  systemctl enable hyyper-node.service >/dev/null
+  systemctl restart hyyper-node.service
+  sleep 2
+  systemctl --no-pager --lines=5 status hyyper-node.service || true
+  say "Fertig. Der Node sollte im Portal gleich als online erscheinen."
+  say "Spielerports (Bereich aus dem Portal) TCP+UDP an der Firewall/Weiterleitung freigeben."
+  say "Logs: journalctl -u hyyper-node -f"
+}
+
+# ---- Forwarder ---------------------------------------------------------------------------------------
+FWD_USER="hyyper-forwarder"; FWD_ENV_DIR="/etc/hyyper-forwarder"; FWD_DATA="/var/lib/hyyper-forwarder"
+fwd_env() { [[ -f "$FWD_ENV_DIR/forwarder.env" ]] && sed -n "s/^$1=//p" "$FWD_ENV_DIR/forwarder.env" | head -1 || true; }
+
+# hyyper-forwarder: setzt die Port-Weiterleitung (nftables-DNAT) aus dem Portal um. Läuft ohne root, nur mit CAP_NET_ADMIN.
+install_forwarder() {
+  [[ -n "$PORTAL_URL" ]] || ask PORTAL_URL "Adresse des Portals (z. B. http://10.0.0.5:8080)"
+  PORTAL_URL="${PORTAL_URL%/}"
+  [[ "$PORTAL_URL" == http* ]] || die "Portal-Adresse muss mit http:// oder https:// beginnen."
+  require_secure "$PORTAL_URL"
+  [[ -n "$TOKEN" ]] || ask TOKEN "Beitritts-Token (Portal → Forwarder → Forwarder anlegen)" secret
+  [[ -n "$TOKEN" ]] || die "Beitritts-Token fehlt."
+
+  say "Installiere Forwarder (hyyper-forwarder) …"
+  apt_install nftables curl ca-certificates
+  if ! id "$FWD_USER" >/dev/null 2>&1; then
+    useradd --system --home-dir "$FWD_DATA" --create-home --shell /usr/sbin/nologin "$FWD_USER"
+  fi
+  mkdir -p "$FWD_DATA" "$FWD_ENV_DIR"; chown "$FWD_USER:$FWD_USER" "$FWD_DATA"; chmod 750 "$FWD_DATA"
+
+  say "Lade hyyper-forwarder vom Portal …"
+  fetch_node_binary "$PORTAL_URL" "$TOKEN"
+  say "Version: $(installed_version)"
+  say "Melde Forwarder beim Portal an …"
+  local enroll ftoken
+  enroll=$(curl -fsS -X POST -H "Authorization: Bearer $TOKEN" "$PORTAL_URL/api/forwarder/enroll") \
+    || die "Beitritt abgelehnt – Token abgelaufen oder schon benutzt? Im Portal einen neuen Beitritts-Token erzeugen."
+  ftoken=$(printf '%s' "$enroll" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  [[ "$ftoken" == hyy_* ]] || die "Unerwartete Antwort vom Portal."
+
+  umask 077
+  cat > "$FWD_ENV_DIR/forwarder.env" <<ENVEOF
+# hyyper-forwarder – Verbindung zum Portal (Token geheim halten)
+HYY_PORTAL_URL=$PORTAL_URL
+HYY_FORWARDER_TOKEN=$ftoken
+HYY_FORWARDER_DATA=$FWD_DATA
+ENVEOF
+  umask 022
+  chown root:"$FWD_USER" "$FWD_ENV_DIR/forwarder.env"; chmod 640 "$FWD_ENV_DIR/forwarder.env"
+
+  # Weiterleiten zwischen Netzen erlauben (Gateway-Betrieb)
+  printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-hyyper-forwarder.conf
+  sysctl -q -p /etc/sysctl.d/99-hyyper-forwarder.conf >/dev/null || say "Hinweis: ip_forward ließ sich nicht setzen (Container ohne Rechte?)."
+
+  cat > /etc/systemd/system/hyyper-forwarder.service <<UNITEOF
+[Unit]
+Description=hyyper-forwarder (hyypervisor Port-Weiterleitung)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$FWD_USER
+EnvironmentFile=$FWD_ENV_DIR/forwarder.env
+ExecStart=$BIN forwarder
+Restart=always
+RestartSec=3
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=$FWD_DATA
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+  systemctl daemon-reload
+  systemctl enable hyyper-forwarder.service >/dev/null
+  systemctl restart hyyper-forwarder.service
+  sleep 2
+  systemctl --no-pager --lines=5 status hyyper-forwarder.service || true
+  say "Fertig. Der Forwarder sollte im Portal gleich als online erscheinen (Admin → Forwarder)."
+  say "Nodes hinter diesem Forwarder: im Portal bei jedem Node die Adresse und den Forwarder eintragen; im Gateway-Modus"
+  say "muss der Forwarder das Standard-Gateway dieser Nodes sein. Außenports (TCP+UDP) an der Firewall zum Forwarder leiten."
+  say "Logs: journalctl -u hyyper-forwarder -f"
+}
+
+# ---- Update / Entfernen / Status -----------------------------------------------------------------
+update_portal() {
+  [[ -f "$PORTAL_ENV_DIR/install.conf" ]] && [[ $ARGS_GIVEN -eq 0 ]] && IMAGE=$(sed -n 's/^IMAGE=//p' "$PORTAL_ENV_DIR/install.conf")
+  say "Aktualisiere Portal (bisher $(installed_version)) …"
+  local tmp; tmp=$(mktemp)
+  fetch_portal_binary "$tmp"
+  install -m 755 "$tmp" "$BIN"; rm -f "$tmp"
+  refresh_self_from_binary
+  systemctl restart hyypervisor.service
+  if unit_exists hyyper-node; then systemctl restart hyyper-node.service; fi
+  if unit_exists hyyper-forwarder; then systemctl restart hyyper-forwarder.service; fi
+  say "Portal ist jetzt auf $(installed_version)."
+}
+
+update_node() {
+  local url tok; url=$(node_env HYY_PORTAL_URL); tok=$(node_env HYY_NODE_TOKEN)
+  [[ -n "$url" && -n "$tok" ]] || die "Keine Node-Konfiguration gefunden ($NODE_ENV_DIR/node.env)."
+  require_secure "$url"
+  say "Aktualisiere Node (bisher $(installed_version)) …"
+  fetch_node_binary "$url" "$tok"
+  local tmp; tmp=$(mktemp); curl -fsSL "$url/get-hyypervisor" -o "$tmp" && install_script_file "$tmp" || say "Hinweis: Skript nicht aktualisiert (Prüfung fehlgeschlagen)."; rm -f "$tmp"
+  systemctl restart hyyper-node.service
+  say "Node ist jetzt auf $(installed_version)."
+}
+
+update_forwarder() {
+  local url tok; url=$(fwd_env HYY_PORTAL_URL); tok=$(fwd_env HYY_FORWARDER_TOKEN)
+  [[ -n "$url" && -n "$tok" ]] || die "Keine Forwarder-Konfiguration gefunden ($FWD_ENV_DIR/forwarder.env)."
+  require_secure "$url"
+  say "Aktualisiere Forwarder (bisher $(installed_version)) …"
+  fetch_node_binary "$url" "$tok"
+  local tmp; tmp=$(mktemp); curl -fsSL "$url/get-hyypervisor" -o "$tmp" && install_script_file "$tmp" || say "Hinweis: Skript nicht aktualisiert (Prüfung fehlgeschlagen)."; rm -f "$tmp"
+  systemctl restart hyyper-forwarder.service
+  say "Forwarder ist jetzt auf $(installed_version)."
+}
+
+uninstall_comp() {
+  case "$1" in
+    portal)
+      systemctl disable --now hyypervisor.service 2>/dev/null || true
+      rm -f /etc/systemd/system/hyypervisor.service; systemctl daemon-reload
+      say "Portal-Dienst entfernt. Daten bleiben unter $PORTAL_DATA, Konfiguration unter $PORTAL_ENV_DIR." ;;
+    node)
+      systemctl disable --now hyyper-node.service hyyper-firewall.service 2>/dev/null || true
+      rm -f /etc/systemd/system/hyyper-node.service /etc/systemd/system/hyyper-firewall.service
+      nft delete table inet hyyper 2>/dev/null || true; systemctl daemon-reload
+      say "Node-Dienst entfernt. Serverdaten bleiben unter $(node_env HYY_NODE_DATA || echo "$NODE_DEFAULT_DATA"). Löschen: rm -rf <Ordner>; Benutzer: userdel $NODE_USER" ;;
+    forwarder)
+      systemctl disable --now hyyper-forwarder.service 2>/dev/null || true
+      rm -f /etc/systemd/system/hyyper-forwarder.service
+      nft delete table ip hyyper_fwd 2>/dev/null || true; systemctl daemon-reload
+      say "Forwarder-Dienst entfernt, Weiterleitungsregeln gelöscht. Konfiguration: $FWD_ENV_DIR, Daten: $FWD_DATA (bleiben). Benutzer: userdel $FWD_USER" ;;
+    *) die "Bauteil angeben: portal | node | forwarder" ;;
+  esac
+}
+
+set_backup_dir() {
+  unit_exists hyyper-node || die "Hier ist kein hyyper-node installiert."
+  [[ -n "$BACKUP_DIR" ]] || die "Aufruf: get-hyypervisor backup-dir <Ordner|off>   (aktuell: $(node_env HYY_NODE_BACKUP_DIR || true))"
+  local data uid new=""
+  data=$(node_env HYY_NODE_DATA); uid=$(id -u "$NODE_USER")
+  [[ -n "$data" ]] || die "Keine Node-Konfiguration gefunden ($NODE_ENV_DIR/node.env)."
+  if [[ "$BACKUP_DIR" != off ]]; then check_backup_dir "$BACKUP_DIR"; new="$BACKUP_DIR"; fi
+  sed -i '/^HYY_NODE_BACKUP_DIR=/d' "$NODE_ENV_DIR/node.env"
+  [[ -z "$new" ]] || printf 'HYY_NODE_BACKUP_DIR=%s\n' "$new" >> "$NODE_ENV_DIR/node.env"
+  sed -i "s#^ReadWritePaths=.*#ReadWritePaths=$data /run/user/$uid${new:+ $new}#" /etc/systemd/system/hyyper-node.service
+  systemctl daemon-reload; systemctl restart hyyper-node.service
+  if [[ -n "$new" ]]; then say "Fremdspeicher gesetzt: $new. Neue Snapshots werden dorthin kopiert (bestehende nicht automatisch)."; else say "Fremdspeicher abgeschaltet. Vorhandene Kopien bleiben liegen."; fi
+}
+
+status() {
+  printf '  %-18s %s\n' "get-hyypervisor" "$([[ -x $SELF ]] && echo installiert || echo 'nicht auf dieser VM')"
+  printf '  %-18s %s\n' "Binary" "$(installed_version)"
+  local c
+  for c in hyypervisor hyyper-node hyyper-forwarder; do
+    if unit_exists "$c"; then printf '  %-18s %s\n' "$c" "$(systemctl is-active "$c" 2>/dev/null || true)"; fi
+  done
+  if unit_exists hyyper-node; then printf '  %-18s %s\n' "Fremdspeicher" "$(v=$(node_env HYY_NODE_BACKUP_DIR); echo "${v:-aus}")"; fi
+}
+
+# ---- Ablauf ----------------------------------------------------------------------------------------------
+[[ -n "$ACTION" ]] || menu
+case "$ACTION" in
+  status) status; exit 0 ;;
+  backup-dir) set_backup_dir; exit 0 ;;
+  uninstall) uninstall_comp "${COMP:-}"; exit 0 ;;
+  update)
+    done_any=0
+    if [[ -z "$COMP" || "$COMP" == portal || "$COMP" == all ]] && unit_exists hyypervisor; then update_portal; done_any=1; fi
+    if [[ -z "$COMP" || "$COMP" == node || "$COMP" == all ]] && unit_exists hyyper-node; then
+      # Auf einer VM mit Portal hat update_portal das gemeinsame Binary schon erneuert.
+      if ! unit_exists hyypervisor; then update_node; fi; done_any=1
+    fi
+    if [[ -z "$COMP" || "$COMP" == forwarder || "$COMP" == all ]] && unit_exists hyyper-forwarder; then
+      if ! unit_exists hyypervisor && ! unit_exists hyyper-node; then update_forwarder; fi; done_any=1
+    fi
+    [[ $done_any -eq 1 ]] || die "Hier ist nichts zum Aktualisieren installiert."
+    exit 0 ;;
+  install) ;;
+  *) die "Unbekannte Aktion: $ACTION" ;;
+esac
+
+[[ ${#COMPS[@]} -gt 0 ]] || menu
+install_self
+
+# Auswahl prüfen: doppelte Angaben sind egal, das Portal kommt immer zuerst.
+WANT_PORTAL=0; WANT_NODE=0; WANT_FWD=0
+for c in "${COMPS[@]}"; do
+  case "$c" in
+    portal) WANT_PORTAL=1 ;;
+    node) WANT_NODE=1 ;;
+    forwarder) WANT_FWD=1 ;;
+    *) die "Unbekanntes Bauteil: $c (portal, node oder forwarder)" ;;
+  esac
+done
+FOLLOW=()
+if [[ $WANT_NODE -eq 1 ]]; then FOLLOW+=(node); fi
+if [[ $WANT_FWD -eq 1 ]]; then FOLLOW+=(forwarder); fi
+if [[ -n "$TOKEN" && $WANT_PORTAL -eq 1 ]]; then die "Beim Portal gibt es keinen Token: --token gehört zu Node/Forwarder (aus dem Portal, nachdem es läuft)."; fi
+if [[ -n "$TOKEN" && ${#FOLLOW[@]} -gt 1 ]]; then die "--token gilt nur für ein Bauteil. Node und Forwarder brauchen je einen eigenen Token: ohne --token starten, das Skript fragt dann nacheinander."; fi
+
+# Nach dem Portal: Einrichtung im Browser, dann Token für die weiteren Bauteile abfragen (Enter = später).
+follow_up_after_portal() {
+  PORTAL_URL="http://127.0.0.1:${PORTAL_LOCAL_PORT:-8080}"
+  local ip c n=3 t label
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}') || true
+  printf '\nDas Portal läuft. Jetzt im Browser einrichten, danach geht es hier weiter:\n'
+  printf '  1. http://%s:%s öffnen und den Assistenten mit dem Setup-Code durchlaufen.\n' "${ip:-<VM-IP>}" "${PORTAL_LOCAL_PORT:-8080}"
+  printf '  2. Einstellungen → Allgemein: "Spieleradresse" eintragen.\n'
+  for c in "${FOLLOW[@]}"; do
+    if [[ "$c" == node ]]; then printf '  %s. Nodes → Node anlegen (Name, Portbereich), Beitritts-Token kopieren.\n' "$n"
+    else printf '  %s. Forwarder → Forwarder anlegen, Beitritts-Token kopieren.\n' "$n"; fi
+    n=$((n + 1))
+  done
+  printf '\n'
+  for c in "${FOLLOW[@]}"; do
+    TOKEN=""
+    if [[ "$c" == node ]]; then label="hyyper-node"; else label="hyyper-forwarder"; fi
+    t=""
+    if (exec </dev/tty) 2>/dev/null; then
+      read -r -s -p "  Beitritts-Token für $label (Enter = später): " t </dev/tty || true
+      echo
+    fi
+    if [[ -n "$t" ]]; then
+      TOKEN="$t"
+      "install_$c"
+    else
+      say "Später installieren: sudo get-hyypervisor install $c --portal $PORTAL_URL   (Token wird abgefragt)"
+    fi
+  done
+}
+
+if [[ $WANT_PORTAL -eq 1 ]]; then
+  install_portal
+  if [[ ${#FOLLOW[@]} -gt 0 ]]; then
+    follow_up_after_portal
+  else
+    cat <<EOF
+
+Weitere VMs (Gameserver-Hosts): Admin → Nodes → "Node anlegen", dort steht der Befehl:
+  curl -fsSL http://<portal>/get-hyypervisor | sudo bash -s -- install node --token <TOKEN>
+Später aktualisieren: sudo get-hyypervisor update
+EOF
+  fi
+else
+  first=1
+  for c in "${FOLLOW[@]}"; do
+    if [[ $first -eq 0 ]]; then TOKEN=""; fi   # jedes Bauteil braucht einen eigenen Token
+    first=0
+    "install_$c"
+  done
+fi
+
+# Lief das Skript nur im Speicher (bash <(curl …)), ist es jetzt noch nicht auf der VM: aus dem installierten Binary ablegen,
+# damit "get-hyypervisor update" funktioniert.
+if [[ ! -x "$SELF" ]]; then refresh_self_from_binary; fi
+if [[ -x "$SELF" ]]; then say "Verwaltung später mit: sudo get-hyypervisor (update, status, uninstall …)"; fi
