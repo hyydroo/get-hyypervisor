@@ -18,6 +18,7 @@
 #
 # Das Portal liefert dieses Skript selbst aus: curl -fsSL http://<portal>/get-hyypervisor | sudo bash
 set -euo pipefail
+cd / 2>/dev/null || true   # ein gelöschtes Arbeitsverzeichnis (getcwd-Fehler) darf nichts stören
 
 PORTAL_DEFAULT="__PORTAL_URL__"          # vom Portal beim Ausliefern eingesetzt
 [[ "$PORTAL_DEFAULT" == __* ]] && PORTAL_DEFAULT=""
