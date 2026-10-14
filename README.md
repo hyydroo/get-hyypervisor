@@ -6,14 +6,16 @@ Dieses Repo enthält nur das Skript; es wird aus dem Hauptprojekt übernommen.
 ## Installieren (Debian 12/13, Ubuntu 22.04+, als root)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor)
+bash <(curl -fsSL get.hyypervised.de)
 ```
 
 Mit `sudo` (funktioniert auch, wenn `sudo` keine offenen Dateideskriptoren durchreicht):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor | sudo bash
+curl -fsSL get.hyypervised.de | sudo bash
 ```
+
+(`get.hyypervised.de` leitet auf `https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor` weiter; diese Adresse funktioniert auch direkt.)
 
 Das Skript fragt, was auf dieser VM installiert werden soll: nur Portal, nur Node, nur Forwarder oder eine Kombination.
 Danach verwaltest du alles mit `get-hyypervisor` (`update`, `status`, `uninstall`, …).
@@ -21,7 +23,7 @@ Danach verwaltest du alles mit `get-hyypervisor` (`update`, `status`, `uninstall
 Direkt ohne Menü, zum Beispiel:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor | sudo bash -s -- install portal
+curl -fsSL get.hyypervised.de | sudo bash -s -- install portal
 ```
 
 ## Vor dem Ausführen prüfen
