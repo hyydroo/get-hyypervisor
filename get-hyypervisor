@@ -33,7 +33,26 @@ BIN="/usr/local/bin/hyypervisor"; SELF="/usr/local/bin/get-hyypervisor"
 
 say() { printf '\033[36m[get-hyypervisor]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[get-hyypervisor] Fehler:\033[0m %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,19p' "$0" 2>/dev/null || true; }
+usage() {
+  cat <<'USAGE'
+get-hyypervisor – installiert und aktualisiert alle Bauteile von hyypervisor als systemd-Dienste (ohne Docker).
+Debian 12/13 oder Ubuntu 22.04+, als root.
+
+  get-hyypervisor [install]           fragt, was installiert werden soll (ein Bauteil oder eine Kombination)
+  get-hyypervisor install portal      hyypervisor  – Portal (Weboberfläche + Verwaltung)
+  get-hyypervisor install node        hyyper-node  – Gameserver-Host (rootless Podman)
+  get-hyypervisor install forwarder   hyyper-forwarder – Port-Weiterleitung zu den Nodes
+  get-hyypervisor install all         Portal + Node auf dieser einen VM
+  get-hyypervisor install portal node forwarder   mehrere Bauteile in einem Lauf (Reihenfolge egal)
+  get-hyypervisor update [Bauteil]    Bauteile aktualisieren (ohne Angabe: alles, was hier installiert ist)
+  get-hyypervisor uninstall <Bauteil> Dienst entfernen (Daten bleiben)
+  get-hyypervisor status              installierte Bauteile und Versionen
+  get-hyypervisor backup-dir <DIR|off>  Fremdspeicher für Snapshot-Kopien des Nodes setzen/abschalten (z. B. NFS-Einhängepunkt)
+
+Optionen portal/all: --image REF  --binary FILE  --listen ADDR  --db URL  --proxies CIDR
+Optionen node:       --portal URL  --token T (oder HYY_JOIN_TOKEN=…, oder Eingabe)  --data DIR  --backup-dir DIR  --allow CIDR  --no-firewall  --registry-login HOST
+USAGE
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,7 +80,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ $EUID -eq 0 ]] || die "Bitte mit root/sudo ausführen."
+[[ $EUID -eq 0 ]] || die "Bitte als root ausführen, z. B.: curl -fsSL <Skript-Adresse> | sudo bash   (oder sudo -E get-hyypervisor …)."
 # Beitritts-Token lieber nicht als Argument (sichtbar in der Prozessliste): HYY_JOIN_TOKEN=… oder Eingabe am Prompt.
 [[ -n "$TOKEN" ]] || TOKEN="${HYY_JOIN_TOKEN:-}"
 unset HYY_JOIN_TOKEN
