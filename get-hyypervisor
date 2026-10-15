@@ -21,7 +21,7 @@ set -euo pipefail
 ORIG_ARGS=("$@")
 # SCRIPT_REV: bei jeder Änderung am Skript erhöhen. "update" holt sich vorher die neueste Fassung aus dem öffentlichen
 # Repo (hyydroo/get-hyypervisor), wenn deren Revision höher ist (HYY_NO_SELFUPDATE=1 schaltet das ab).
-SCRIPT_REV=2
+SCRIPT_REV=3
 SCRIPT_RAW="https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor"
 cd / 2>/dev/null || true   # ein gelöschtes Arbeitsverzeichnis (getcwd-Fehler) darf nichts stören
 
@@ -62,7 +62,7 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    install|update|uninstall|status) ACTION="$1"; shift ;;
+    install|update|uninstall|status|run-request) ACTION="$1"; shift ;;
     backup-dir) ACTION="backup-dir"; shift; if [[ $# -gt 0 && "$1" != -* ]]; then BACKUP_DIR="$1"; shift; fi ;;
     portal|node|forwarder) COMP="$1"; COMPS+=("$1"); shift ;;
     all) COMP="all"; COMPS+=(portal node); shift ;;
@@ -283,6 +283,7 @@ ReadWritePaths=$PORTAL_DATA
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+  ensure_updater
   systemctl enable hyypervisor.service >/dev/null
   local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
   systemctl restart hyypervisor.service
@@ -461,6 +462,7 @@ EOF
   fi
 
   systemctl daemon-reload
+  ensure_updater
   systemctl enable hyyper-node.service >/dev/null
   systemctl restart hyyper-node.service
   sleep 2
@@ -543,6 +545,7 @@ ReadWritePaths=$FWD_DATA
 WantedBy=multi-user.target
 UNITEOF
   systemctl daemon-reload
+  ensure_updater
   systemctl enable hyyper-forwarder.service >/dev/null
   systemctl restart hyyper-forwarder.service
   sleep 2
@@ -551,6 +554,84 @@ UNITEOF
   say "Nodes hinter diesem Forwarder: im Portal bei jedem Node die Adresse und den Forwarder eintragen; im Gateway-Modus"
   say "muss der Forwarder das Standard-Gateway dieser Nodes sein. Außenports (TCP+UDP) an der Firewall zum Forwarder leiten."
   say "Logs: journalctl -u hyyper-forwarder -f"
+}
+
+# ---- Update-Dienst (Updates aus dem Portal heraus) -------------------------------------------------
+# Portal, Node und Forwarder laufen abgeschottet und dürfen ihr Binary nicht ersetzen. Darum legt dieses Skript einen kleinen
+# Dienst an: hyyper-update.path wartet auf die Datei $UPD_DIR/request (legt der Dienst der VM ab, Gruppe hyyper-update),
+# hyyper-update.service (root) führt dann "get-hyypervisor run-request" aus. Die Datei wird nur gelesen (feste Schlüssel,
+# strenge Prüfung), nie ausgeführt, und sofort gelöscht (sie kann den GitHub-Zugang für das Portal-Update enthalten).
+UPD_DIR="/var/lib/hyyper-update"; UPD_GROUP="hyyper-update"; UPD_LOG="/var/log/hyyper-update.log"
+
+upd_status() { # upd_status <running|ok|failed> <Text>
+  [[ -d "$UPD_DIR" ]] || return 0
+  local tmp; tmp=$(mktemp -p "$UPD_DIR" .status.XXXXXX) || return 0
+  printf 'state=%s\nmessage=%s\nversion=%s\ntime=%s\n' "$1" "${2//$'\n'/ }" "$(installed_version)" "$(date +%s)" > "$tmp"
+  chgrp "$UPD_GROUP" "$tmp"; chmod 640 "$tmp"; mv -fT "$tmp" "$UPD_DIR/status"
+}
+
+ensure_updater() {
+  have systemctl && [[ -d /run/systemd/system ]] || return 0
+  getent group "$UPD_GROUP" >/dev/null || groupadd --system "$UPD_GROUP"
+  install -d -m 0770 -o root -g "$UPD_GROUP" "$UPD_DIR"
+  local svc
+  for svc in hyypervisor hyyper-node hyyper-forwarder; do
+    unit_exists "$svc" || continue
+    mkdir -p "/etc/systemd/system/$svc.service.d"
+    cat > "/etc/systemd/system/$svc.service.d/updater.conf" <<EOF
+[Service]
+SupplementaryGroups=$UPD_GROUP
+ReadWritePaths=$UPD_DIR
+EOF
+  done
+  cat > /etc/systemd/system/hyyper-update.service <<EOF
+[Unit]
+Description=hyypervisor Update-Auftrag ausführen
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SELF run-request
+TimeoutStartSec=45min
+EOF
+  cat > /etc/systemd/system/hyyper-update.path <<EOF
+[Unit]
+Description=hyypervisor Update-Auftrag wartet
+
+[Path]
+PathExists=$UPD_DIR/request
+Unit=hyyper-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now hyyper-update.path >/dev/null 2>&1 || say "Hinweis: Update-Dienst (hyyper-update.path) ließ sich nicht starten."
+}
+
+# Führt den Auftrag aus $UPD_DIR/request aus (aufgerufen von hyyper-update.service als root).
+run_request() {
+  local f="$UPD_DIR/request" comps="" ghu="" ght="" line k v
+  [[ -f "$f" && ! -L "$f" ]] || exit 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    k="${line%%=*}"; v="${line#*=}"
+    case "$k" in components) comps="$v" ;; ghcr_user) ghu="$v" ;; ghcr_token) ght="$v" ;; esac
+  done < <(head -c 4096 "$f")
+  rm -f "$f"
+  if [[ ! "$comps" =~ ^(portal|node|forwarder)(,(portal|node|forwarder)){0,2}$ ]]; then upd_status failed "ungültiger Auftrag"; exit 1; fi
+  if [[ -n "$ghu$ght" ]] && [[ ! "$ghu" =~ ^[A-Za-z0-9-]{1,39}$ || ! "$ght" =~ ^[A-Za-z0-9_]{1,255}$ ]]; then upd_status failed "ungültiger GitHub-Zugang"; exit 1; fi
+  upd_status running "Update läuft ($comps)"
+  { printf '\n=== %s Update %s ===\n' "$(date '+%F %T')" "$comps"; } >> "$UPD_LOG"
+  local rc=0 c
+  for c in portal node forwarder; do
+    [[ ",$comps," == *",$c,"* ]] || continue
+    # Den GitHub-Zugang bekommt nur das Portal-Update (Image-Download); Node und Forwarder laden vom Portal.
+    if [[ "$c" == portal ]]; then GHCR_USER="$ghu" GHCR_TOKEN="$ght" "$SELF" update portal >> "$UPD_LOG" 2>&1 || rc=1
+    else "$SELF" update "$c" >> "$UPD_LOG" 2>&1 || rc=1; fi
+  done
+  if [[ $rc -eq 0 ]]; then upd_status ok "Update abgeschlossen ($comps)"; else upd_status failed "Update fehlgeschlagen, Log: $UPD_LOG"; fi
+  exit $rc
 }
 
 # ---- Update / Entfernen / Status -----------------------------------------------------------------
@@ -645,10 +726,12 @@ status() {
 [[ -n "$ACTION" ]] || menu
 case "$ACTION" in
   status) status; exit 0 ;;
+  run-request) run_request ;;
   backup-dir) set_backup_dir; exit 0 ;;
   uninstall) uninstall_comp "${COMP:-}"; exit 0 ;;
   update)
     selfupdate_latest
+    ensure_updater
     done_any=0
     if [[ -z "$COMP" || "$COMP" == portal || "$COMP" == all ]] && unit_exists hyypervisor; then update_portal; done_any=1; fi
     if [[ -z "$COMP" || "$COMP" == node || "$COMP" == all ]] && unit_exists hyyper-node; then
