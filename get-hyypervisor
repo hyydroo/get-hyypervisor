@@ -18,6 +18,11 @@
 #
 # Das Portal liefert dieses Skript selbst aus: curl -fsSL http://<portal>/get-hyypervisor | sudo bash
 set -euo pipefail
+ORIG_ARGS=("$@")
+# SCRIPT_REV: bei jeder Änderung am Skript erhöhen. "update" holt sich vorher die neueste Fassung aus dem öffentlichen
+# Repo (hyydroo/get-hyypervisor), wenn deren Revision höher ist (HYY_NO_SELFUPDATE=1 schaltet das ab).
+SCRIPT_REV=2
+SCRIPT_RAW="https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor"
 cd / 2>/dev/null || true   # ein gelöschtes Arbeitsverzeichnis (getcwd-Fehler) darf nichts stören
 
 PORTAL_DEFAULT="__PORTAL_URL__"          # vom Portal beim Ausliefern eingesetzt
@@ -127,6 +132,19 @@ install_self() {
     tmp=$(mktemp); curl -fsSL "$url/get-hyypervisor" -o "$tmp" && install_script_file "$tmp" || say "Hinweis: get-hyypervisor konnte nicht auf diese VM gelegt werden."
     rm -f "$tmp"
   fi
+}
+# Vor einem Update die neueste Skript-Fassung holen und damit neu starten (nur wenn die Revision höher ist).
+selfupdate_latest() {
+  [[ "${HYY_NO_SELFUPDATE:-}" == 1 ]] && return 0
+  local tmp rev; tmp=$(mktemp)
+  if curl -fsSL --max-time 10 "$SCRIPT_RAW" -o "$tmp" 2>/dev/null; then
+    rev=$(sed -n 's/^SCRIPT_REV=\([0-9][0-9]*\)$/\1/p' "$tmp" | head -1)
+    if [[ -n "$rev" && "$rev" -gt "$SCRIPT_REV" ]] && install_script_file "$tmp"; then
+      rm -f "$tmp"; say "Skript auf Revision $rev aktualisiert, starte neu …"
+      HYY_NO_SELFUPDATE=1 exec "$SELF" "${ORIG_ARGS[@]}"
+    fi
+  fi
+  rm -f "$tmp"
 }
 refresh_self_from_binary() { local f; f=$(mktemp); if [[ -x "$BIN" ]] && "$BIN" script > "$f" 2>/dev/null; then install_script_file "$f" || true; fi; rm -f "$f"; }
 
@@ -537,8 +555,13 @@ UNITEOF
 
 # ---- Update / Entfernen / Status -----------------------------------------------------------------
 update_portal() {
-  [[ -f "$PORTAL_ENV_DIR/install.conf" ]] && [[ $ARGS_GIVEN -eq 0 ]] && IMAGE=$(sed -n 's/^IMAGE=//p' "$PORTAL_ENV_DIR/install.conf")
-  say "Aktualisiere Portal (bisher $(installed_version)) …"
+  if [[ -f "$PORTAL_ENV_DIR/install.conf" ]] && [[ $ARGS_GIVEN -eq 0 ]]; then
+    IMAGE=$(sed -n 's/^IMAGE=//p' "$PORTAL_ENV_DIR/install.conf")
+    # Das Standard-Image wird immer auf :latest gehoben (ein früher gemerkter fester Tag hielte das Update sonst auf); eigene Quellen bleiben.
+    case "$IMAGE" in ghcr.io/hyydroo/hyypervisor:*) IMAGE="ghcr.io/hyydroo/hyypervisor:latest"; printf 'IMAGE=%s\n' "$IMAGE" > "$PORTAL_ENV_DIR/install.conf" ;; esac
+  fi
+  local before; before=$(installed_version)
+  say "Aktualisiere Portal (bisher $before) …"
   local tmp; tmp=$(mktemp)
   fetch_portal_binary "$tmp"
   install -m 755 "$tmp" "$BIN"; rm -f "$tmp"
@@ -547,6 +570,9 @@ update_portal() {
   if unit_exists hyyper-node; then systemctl restart hyyper-node.service; fi
   if unit_exists hyyper-forwarder; then systemctl restart hyyper-forwarder.service; fi
   say "Portal ist jetzt auf $(installed_version)."
+  if [[ "$before" == "$(installed_version)" ]]; then
+    say "Hinweis: keine neuere Version im Image $IMAGE gefunden. Steht auf GitHub eine neuere? Dann ist der Image-Bau (GitHub Actions) noch nicht durch oder fehlgeschlagen."
+  fi
 }
 
 update_node() {
@@ -622,6 +648,7 @@ case "$ACTION" in
   backup-dir) set_backup_dir; exit 0 ;;
   uninstall) uninstall_comp "${COMP:-}"; exit 0 ;;
   update)
+    selfupdate_latest
     done_any=0
     if [[ -z "$COMP" || "$COMP" == portal || "$COMP" == all ]] && unit_exists hyypervisor; then update_portal; done_any=1; fi
     if [[ -z "$COMP" || "$COMP" == node || "$COMP" == all ]] && unit_exists hyyper-node; then
