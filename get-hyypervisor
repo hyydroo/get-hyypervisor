@@ -14,6 +14,7 @@
 #   get-hyypervisor backup-dir <DIR|off>  Fremdspeicher für Snapshot-Kopien des Nodes setzen/abschalten (z. B. NFS-Einhängepunkt)
 #
 # Optionen portal/all: --image REF  --binary FILE  --listen ADDR  --db URL  --proxies CIDR
+# Optionen alle:       --uid N  feste UID/GID des Dienstbenutzers hyypervisor (Standard 2100, auf allen VMs gleich lassen)
 # Optionen node:       --portal URL  --token T (oder HYY_JOIN_TOKEN=…, oder Eingabe)  --data DIR  --backup-dir DIR  --allow CIDR  --no-firewall  --registry-login HOST
 #
 # Das Portal liefert dieses Skript selbst aus: curl -fsSL http://<portal>/get-hyypervisor | sudo bash
@@ -21,7 +22,7 @@ set -euo pipefail
 ORIG_ARGS=("$@")
 # SCRIPT_REV: bei jeder Änderung am Skript erhöhen. "update" holt sich vorher die neueste Fassung aus dem öffentlichen
 # Repo (hyydroo/get-hyypervisor), wenn deren Revision höher ist (HYY_NO_SELFUPDATE=1 schaltet das ab).
-SCRIPT_REV=4
+SCRIPT_REV=5
 SCRIPT_RAW="https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor"
 cd / 2>/dev/null || true   # ein gelöschtes Arbeitsverzeichnis (getcwd-Fehler) darf nichts stören
 
@@ -33,8 +34,14 @@ IMAGE="ghcr.io/hyydroo/hyypervisor:latest"; BINARY=""; LISTEN=":8080"; DB=""; PR
 PORTAL_URL="$PORTAL_DEFAULT"; TOKEN=""; NODE_DATA=""; BACKUP_DIR=""; FIREWALL=1; ALLOW=(); REGISTRY=""
 ARGS_GIVEN=0
 
-PORTAL_USER="hyypervisor"; PORTAL_DATA="/var/lib/hyypervisor"; PORTAL_ENV_DIR="/etc/hyypervisor"
-NODE_USER="hyyper"; NODE_ENV_DIR="/etc/hyyper-node"; NODE_DEFAULT_DATA="/var/lib/hyyper-node"
+# Ein Dienstbenutzer für Portal, Node und Forwarder (auch alles auf einer VM) mit fester UID/GID: Datastores und Cluster-Ordner
+# auf NFS brauchen auf allen VMs dieselbe Nummer, sonst gehören die Dateien auf der zweiten VM einem Fremden.
+SVC_USER="hyypervisor"; SVC_UID="${HYY_UID:-2100}"; SVC_HOME="/var/lib/hyypervisor"
+PORTAL_USER="$SVC_USER"; PORTAL_DATA="$SVC_HOME"; PORTAL_ENV_DIR="/etc/hyypervisor"
+NODE_ENV_DIR="/etc/hyyper-node"; NODE_DEFAULT_DATA="/var/lib/hyyper-node"
+# Laufende Installationen behalten ihren Benutzer (vor Revision 5: hyyper / hyyper-forwarder); Neuinstallationen nutzen SVC_USER.
+unit_user() { sed -n 's/^User=//p' "/etc/systemd/system/$1.service" 2>/dev/null | head -1; }
+NODE_USER="$(unit_user hyyper-node)"; NODE_USER="${NODE_USER:-$SVC_USER}"
 BIN="/usr/local/bin/hyypervisor"; SELF="/usr/local/bin/get-hyypervisor"
 
 say() { printf '\033[36m[get-hyypervisor]\033[0m %s\n' "$*"; }
@@ -80,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     --no-firewall) FIREWALL=0; shift ;;
     --registry-login) REGISTRY="$2"; shift 2 ;;
     --mode) COMP="$2"; [[ "$COMP" == agent ]] && COMP=node; if [[ "$COMP" == all ]]; then COMPS+=(portal node); else COMPS+=("$COMP"); fi; [[ -n "$ACTION" ]] || ACTION=install; shift 2 ;;   # alte Schreibweise
+    --uid) SVC_UID="$2"; shift 2 ;;
     --uninstall) ACTION="uninstall"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unbekannte Option: $1 (siehe --help)" ;;
@@ -220,15 +228,43 @@ fetch_portal_binary() {
   if [[ $logged_in -eq 1 ]]; then podman logout ghcr.io >/dev/null 2>&1 || true; fi
 }
 
+# ensure_svc_user: Dienstbenutzer mit fester UID/GID anlegen bzw. prüfen. Gibt es ihn schon mit anderer Nummer, wird nichts
+# umgestellt (Dateien gehören dann der alten Nummer), aber deutlich gewarnt – für Datastores/NFS muss die Nummer überall gleich sein.
+ensure_svc_user() {
+  # Prozesse desselben Benutzers dürfen sich sonst gegenseitig auslesen (ptrace); Ubuntu hat 1 schon als Standard.
+  if [[ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 1)" == 0 ]]; then
+    printf 'kernel.yama.ptrace_scope = 1
+' > /etc/sysctl.d/60-hyypervisor-ptrace.conf
+    sysctl -q -p /etc/sysctl.d/60-hyypervisor-ptrace.conf || true
+    say "ptrace auf eigene Kindprozesse beschränkt (kernel.yama.ptrace_scope=1, /etc/sysctl.d/60-hyypervisor-ptrace.conf)."
+  fi
+  [[ "$SVC_UID" =~ ^[0-9]+$ && "$SVC_UID" -ge 1000 && "$SVC_UID" -le 60000 ]] || die "Ungültige UID $SVC_UID (1000 bis 60000)."
+  if id "$SVC_USER" >/dev/null 2>&1; then
+    local cur; cur=$(id -u "$SVC_USER")
+    if [[ "$cur" != "$SVC_UID" ]]; then
+      say "WARNUNG: Benutzer $SVC_USER hat UID $cur statt $SVC_UID. Auf allen VMs muss sie gleich sein (Datastores, Cluster auf NFS)."
+      say "         Umstellen (Dienste vorher stoppen): usermod -u $SVC_UID $SVC_USER && groupmod -g $SVC_UID $SVC_USER, danach Dateien mit chown -R neu zuweisen."
+    fi
+  else
+    local u g
+    u=$(getent passwd "$SVC_UID" | cut -d: -f1 || true); g=$(getent group "$SVC_UID" | cut -d: -f1 || true)
+    [[ -z "$u" ]] || die "UID $SVC_UID ist schon an $u vergeben. Andere feste Nummer wählen (--uid N) und auf allen VMs dieselbe nehmen."
+    [[ -z "$g" || "$g" == "$SVC_USER" ]] || die "GID $SVC_UID ist schon an die Gruppe $g vergeben. Andere Nummer wählen (--uid N)."
+    getent group "$SVC_USER" >/dev/null || groupadd --gid "$SVC_UID" "$SVC_USER"
+    [[ "$(getent group "$SVC_USER" | cut -d: -f3)" == "$SVC_UID" ]] || die "Gruppe $SVC_USER hat nicht die GID $SVC_UID."
+    useradd --system --uid "$SVC_UID" --gid "$SVC_USER" --home-dir "$SVC_HOME" --create-home --shell /usr/sbin/nologin "$SVC_USER" 2>/dev/null \
+      || useradd --uid "$SVC_UID" --gid "$SVC_USER" --home-dir "$SVC_HOME" --create-home --shell /usr/sbin/nologin "$SVC_USER"
+  fi
+  mkdir -p "$SVC_HOME"; chown "$SVC_USER:$SVC_USER" "$SVC_HOME"; chmod 700 "$SVC_HOME"
+}
+
 install_portal() {
   say "Installiere Portal (hyypervisor) …"
   PKGS=(curl ca-certificates openssl); [[ -n "$BINARY" ]] || PKGS+=(podman)
   apt_install "${PKGS[@]}"
-  if ! id "$PORTAL_USER" >/dev/null 2>&1; then
-    useradd --system --home-dir "$PORTAL_DATA" --create-home --shell /usr/sbin/nologin "$PORTAL_USER"
-  fi
+  ensure_svc_user
   mkdir -p "$PORTAL_DATA" "$PORTAL_ENV_DIR"
-  chown "$PORTAL_USER:$PORTAL_USER" "$PORTAL_DATA"; chmod 750 "$PORTAL_DATA"
+  chown "$PORTAL_USER:$PORTAL_USER" "$PORTAL_DATA"; chmod 700 "$PORTAL_DATA"
 
   local tmp; tmp=$(mktemp)
   fetch_portal_binary "$tmp"
@@ -278,6 +314,8 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictSUIDSGID=true
 LockPersonality=true
 ReadWritePaths=$PORTAL_DATA
+# Gleicher Benutzer wie Node/Forwarder auf derselben VM: deren Tokens bleiben für das Portal unsichtbar
+InaccessiblePaths=-$NODE_ENV_DIR -$FWD_ENV_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -339,9 +377,8 @@ install_node() {
   apt_install podman uidmap passt nftables curl ca-certificates
   [[ -f /sys/fs/cgroup/cgroup.controllers ]] || die "cgroups v2 nicht aktiv."
 
-  if ! id "$NODE_USER" >/dev/null 2>&1; then
-    useradd --system --create-home --home-dir "$data" --shell /usr/sbin/nologin "$NODE_USER"
-  fi
+  NODE_USER="$SVC_USER"; ensure_svc_user
+  case "$data/" in "$PORTAL_DATA/"*|"$PORTAL_ENV_DIR/"*) die "Der Node-Datenordner darf nicht im Portal-Ordner liegen ($data)." ;; esac
   mkdir -p "$data/servers"; chown -R "$NODE_USER:$NODE_USER" "$data"; chmod 750 "$data"
   grep -q "^$NODE_USER:" /etc/subuid || usermod --add-subuids 200000-265535 "$NODE_USER"
   grep -q "^$NODE_USER:" /etc/subgid || usermod --add-subgids 200000-265535 "$NODE_USER"
@@ -354,6 +391,12 @@ install_node() {
 [Service]
 Delegate=cpu cpuset io memory pids
 EOF
+  # Images und Container-Schichten in den Node-Datenordner (große Platte), nicht ins Home des Dienstbenutzers
+  local home; home=$(getent passwd "$NODE_USER" | cut -d: -f6)
+  install -d -m 700 -o "$NODE_USER" -g "$NODE_USER" "$home/.config" "$home/.config/containers"
+  install -d -m 700 -o "$NODE_USER" -g "$NODE_USER" "$data/.local" "$data/.local/share" "$data/.local/share/containers"
+  printf '[storage]\ndriver = "overlay"\ngraphroot = "%s/.local/share/containers/storage"\n' "$data" > "$home/.config/containers/storage.conf"
+  chown "$NODE_USER:$NODE_USER" "$home/.config/containers/storage.conf"; chmod 600 "$home/.config/containers/storage.conf"
   systemctl daemon-reload
   systemctl --user -M "$NODE_USER@" enable --now podman.socket >/dev/null
   local socket="/run/user/$uid/podman/podman.sock"
@@ -365,9 +408,10 @@ EOF
     [[ -n "$ru" ]] || ask ru "Benutzername für $REGISTRY"
     [[ -n "$rt" ]] || ask rt "Token/Passwort für $REGISTRY" secret
     [[ -n "$ru" && -n "$rt" ]] || die "Benutzername und Token dürfen nicht leer sein."
-    local adir="$data/.config/containers"
-    install -d -m 700 -o "$NODE_USER" -g "$NODE_USER" "$data/.config" "$adir"
-    printf '%s' "$rt" | runuser -u "$NODE_USER" -- env HOME="$data" XDG_RUNTIME_DIR="/run/user/$uid" \
+    # Podman (Benutzerdienst) liest die Anmeldung aus dem Home-Ordner des Benutzers, nicht aus dem Node-Datenordner
+    local adir="$home/.config/containers"
+    install -d -m 700 -o "$NODE_USER" -g "$NODE_USER" "$home/.config" "$adir"
+    printf '%s' "$rt" | runuser -u "$NODE_USER" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
       podman login "$REGISTRY" -u "$ru" --password-stdin --authfile "$adir/auth.json" >/dev/null \
       || die "Anmeldung an $REGISTRY fehlgeschlagen."
     chmod 600 "$adir/auth.json"; say "Registry-Anmeldung für $REGISTRY gespeichert."
@@ -413,6 +457,8 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
 ReadWritePaths=$data /run/user/$uid${BACKUP_DIR:+ $BACKUP_DIR}
+# Gleicher Benutzer wie das Portal: Datenbank, Portal-Geheimnis und Forwarder-Token bleiben für den Node unsichtbar
+InaccessiblePaths=-$PORTAL_DATA -$PORTAL_ENV_DIR -$FWD_ENV_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -421,9 +467,8 @@ EOF
   if [[ $FIREWALL -eq 1 ]]; then
     local allow=""
     for c in "${ALLOW[@]}"; do allow+="    ip daddr $c accept"$'\n'; done
-    local phost ip ns
-    phost=$(echo "$PORTAL_URL" | sed -E 's#^https?://([^/:]+).*#\1#')
-    for ip in $(getent ahostsv4 "$phost" | awk '{print $1}' | sort -u); do allow+="    ip daddr $ip meta l4proto tcp accept"$'\n'; done
+    # Der Node selbst (eigener Dienst) ist nicht betroffen, nur die Gameserver: die brauchen das Portal nicht, nur DNS.
+    local ns
     for ns in $(awk '/^nameserver/ {print $2}' /etc/resolv.conf | grep -E '^[0-9.]+$' || true); do
       allow+="    ip daddr $ns meta l4proto { tcp, udp } th dport 53 accept"$'\n'
     done
@@ -431,11 +476,15 @@ EOF
 table inet hyyper
 delete table inet hyyper
 table inet hyyper {
+  # Nur Prozesse im Podman-Benutzerdienst (Gameserver-Container, pasta) – Portal, Node und Forwarder desselben Benutzers laufen
+  # als Systemdienste und dürfen weiter ins LAN (z. B. PostgreSQL, SMTP).
   chain output {
     type filter hook output priority 0; policy accept;
-    meta skuid != $uid accept
     ct state established,related accept
     oif lo accept
+    socket cgroupv2 level 3 "user.slice/user-$uid.slice/user@$uid.service" jump gameservers
+  }
+  chain gameservers {
 $allow    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } drop
     ip6 daddr { fc00::/7, fe80::/10 } drop
   }
@@ -445,7 +494,11 @@ EOF
 [Unit]
 Description=hyyper-node Firewall (Gameserver ohne Zugriff auf private Netze)
 Before=hyyper-node.service
-After=nftables.service
+# Die Regel gilt nur für Prozesse im Podman-Benutzerdienst (Gameserver), nicht für Portal/Node/Forwarder desselben Benutzers.
+# nft löst den cgroup-Pfad beim Laden auf: nach dem Benutzerdienst starten und mit ihm neu laden.
+After=nftables.service user@$uid.service
+Wants=user@$uid.service
+PartOf=user@$uid.service
 
 [Service]
 Type=oneshot
@@ -457,8 +510,10 @@ ExecStop=/usr/sbin/nft delete table inet hyyper
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now hyyper-firewall.service >/dev/null
-    say "Firewall aktiv (Ausnahmen mit --allow CIDR)."
+    systemctl enable hyyper-firewall.service >/dev/null
+    systemctl restart hyyper-firewall.service || die "Firewall ließ sich nicht laden (nft mit cgroupv2 nötig). Log: journalctl -u hyyper-firewall -e"
+    nft list table inet hyyper 2>/dev/null | grep -q "user@$uid.service" || die "Firewall-Regel für die Gameserver fehlt."
+    say "Firewall aktiv für die Gameserver-Container (Ausnahmen mit --allow CIDR)."
   fi
 
   systemctl daemon-reload
@@ -473,7 +528,8 @@ EOF
 }
 
 # ---- Forwarder ---------------------------------------------------------------------------------------
-FWD_USER="hyyper-forwarder"; FWD_ENV_DIR="/etc/hyyper-forwarder"; FWD_DATA="/var/lib/hyyper-forwarder"
+FWD_ENV_DIR="/etc/hyyper-forwarder"; FWD_DATA="/var/lib/hyyper-forwarder"
+FWD_USER="$(unit_user hyyper-forwarder)"; FWD_USER="${FWD_USER:-$SVC_USER}"
 fwd_env() { [[ -f "$FWD_ENV_DIR/forwarder.env" ]] && sed -n "s/^$1=//p" "$FWD_ENV_DIR/forwarder.env" | head -1 || true; }
 
 # hyyper-forwarder: setzt die Port-Weiterleitung (nftables-DNAT) aus dem Portal um. Läuft ohne root, nur mit CAP_NET_ADMIN.
@@ -487,9 +543,7 @@ install_forwarder() {
 
   say "Installiere Forwarder (hyyper-forwarder) …"
   apt_install nftables curl ca-certificates
-  if ! id "$FWD_USER" >/dev/null 2>&1; then
-    useradd --system --home-dir "$FWD_DATA" --create-home --shell /usr/sbin/nologin "$FWD_USER"
-  fi
+  FWD_USER="$SVC_USER"; ensure_svc_user
   mkdir -p "$FWD_DATA" "$FWD_ENV_DIR"; chown "$FWD_USER:$FWD_USER" "$FWD_DATA"; chmod 750 "$FWD_DATA"
 
   say "Lade hyyper-forwarder vom Portal …"
@@ -540,6 +594,8 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictSUIDSGID=true
 LockPersonality=true
 ReadWritePaths=$FWD_DATA
+# Gleicher Benutzer wie Portal/Node: deren Daten und Tokens bleiben für den Forwarder unsichtbar
+InaccessiblePaths=-$PORTAL_DATA -$PORTAL_ENV_DIR -$NODE_ENV_DIR
 
 [Install]
 WantedBy=multi-user.target
