@@ -16,13 +16,14 @@
 # Optionen portal/all: --image REF  --binary FILE  --listen ADDR  --db URL  --proxies CIDR
 # Optionen alle:       --uid N  feste UID/GID des Dienstbenutzers hyypervisor (Standard 2100, auf allen VMs gleich lassen)
 # Optionen node:       --portal URL  --token T (oder HYY_JOIN_TOKEN=…, oder Eingabe)  --data DIR  --backup-dir DIR  --allow CIDR  --no-firewall  --registry-login HOST
+#                      Ohne --data fragt die Installation mit Terminal nach dem Speicherort der Gameserver-Daten (Standard oder eigener Ordner, z. B. zweite Platte).
 #
 # Das Portal liefert dieses Skript selbst aus: curl -fsSL http://<portal>/get-hyypervisor | sudo bash
 set -euo pipefail
 ORIG_ARGS=("$@")
 # SCRIPT_REV: bei jeder Änderung am Skript erhöhen. "update" holt sich vorher die neueste Fassung aus dem öffentlichen
 # Repo (hyydroo/get-hyypervisor), wenn deren Revision höher ist (HYY_NO_SELFUPDATE=1 schaltet das ab).
-SCRIPT_REV=5
+SCRIPT_REV=7
 SCRIPT_RAW="https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor"
 cd / 2>/dev/null || true   # ein gelöschtes Arbeitsverzeichnis (getcwd-Fehler) darf nichts stören
 
@@ -69,7 +70,7 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    install|update|uninstall|status|run-request) ACTION="$1"; shift ;;
+    install|update|uninstall|status|run-request|run-mounts) ACTION="$1"; shift ;;
     backup-dir) ACTION="backup-dir"; shift; if [[ $# -gt 0 && "$1" != -* ]]; then BACKUP_DIR="$1"; shift; fi ;;
     portal|node|forwarder) COMP="$1"; COMPS+=("$1"); shift ;;
     all) COMP="all"; COMPS+=(portal node); shift ;;
@@ -355,6 +356,45 @@ check_backup_dir() {
 
 node_env() { [[ -f "$NODE_ENV_DIR/node.env" ]] && sed -n "s/^$1=//p" "$NODE_ENV_DIR/node.env" | head -1 || true; }
 
+# Datenordner des Nodes (Serverdateien, Images): absolut, kein Netzwerkspeicher (Podman-overlay läuft dort nicht), und kein
+# fremder Ordner mit Inhalt, denn der ganze Ordner wird dem Dienstbenutzer übergeben (chown -R).
+check_data_dir() {
+  local d="$1" p fs ok
+  [[ "$d" =~ ^/[A-Za-z0-9._/@+-]+$ && "$d" != *..* ]] || die "Ungültiger Datenordner: nur absolute Pfade ohne Leer- und Sonderzeichen."
+  p="$d"; while [[ ! -e "$p" ]]; do p=$(dirname "$p"); done   # nächster vorhandener Ordner, für Platte und Platz
+  fs=$(findmnt -no FSTYPE -T "$p" 2>/dev/null || true)
+  case "$fs" in nfs*|cifs|smb*|fuse.sshfs) die "Datenordner $d liegt auf Netzwerkspeicher ($fs). Dafür ist nur ein lokaler Datenträger geeignet (NFS nur als Datastore/Fremdspeicher)." ;; esac
+  if [[ -d "$d" && ! -d "$d/servers" && -n "$(find "$d" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)" ]]; then
+    die "$d enthält fremde Dateien und würde komplett dem Dienstbenutzer übergeben. Einen eigenen Unterordner angeben, z. B. $d/hyyper-node."
+  fi
+  say "Datenordner $d: $(df -h --output=avail "$p" | tail -1 | tr -d ' ') frei."
+  if [[ "$d" != "$NODE_DEFAULT_DATA" && "$(stat -c %d "$p")" == "$(stat -c %d /)" ]]; then
+    say "Hinweis: $d liegt auf derselben Platte wie das Betriebssystem (zweite Platte schon eingehängt?)."
+    if (exec </dev/tty) 2>/dev/null; then ask ok "Trotzdem hier anlegen? [j/N]"; [[ "$ok" =~ ^[jJyY] ]] || die "Abgebrochen."; fi
+  fi
+}
+
+# Speicherort der Gameserver-Daten: --data gilt immer, eine vorhandene Installation behält ihren Ordner, sonst wird gefragt
+# (nur mit Terminal; ohne bleibt es beim Standard).
+choose_node_data() {
+  [[ -n "$NODE_DATA" ]] || NODE_DATA=$(node_env HYY_NODE_DATA)
+  [[ -z "$NODE_DATA" ]] || return 0
+  (exec </dev/tty) 2>/dev/null || return 0
+  local a d
+  cat >/dev/tty <<EOF
+
+  Wo sollen die Daten der Gameserver (Serverdateien, Images) liegen?
+
+    1) Standard: $NODE_DEFAULT_DATA   (auf der Systemplatte)
+    2) Eigener Ordner, z. B. auf einer zweiten Festplatte (vorher einhängen, z. B. /mnt/daten/hyyper-node)
+
+EOF
+  read -r -p "  Auswahl [1-2, Enter = 1]: " a </dev/tty
+  [[ "$a" == 2 ]] || return 0
+  ask d "Ordner (absoluter Pfad)"
+  NODE_DATA="${d%/}"
+}
+
 fetch_node_binary() { # fetch_node_binary <portal> <token>
   case "$(uname -m)" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; *) die "Architektur $(uname -m) wird nicht unterstützt." ;; esac
   local tmp; tmp=$(mktemp)
@@ -371,7 +411,9 @@ install_node() {
   [[ "$PORTAL_URL" == https://* ]] || say "Achtung: Portal ohne HTTPS – nur im LAN/Test verwenden."
   [[ -n "$TOKEN" ]] || ask TOKEN "Beitritts-Token (Portal → Nodes → Node anlegen)" secret
   [[ -n "$TOKEN" ]] || die "Beitritts-Token fehlt."
+  choose_node_data
   local data="${NODE_DATA:-$NODE_DEFAULT_DATA}"
+  check_data_dir "$data"
 
   say "Installiere Node (hyyper-node) …"
   apt_install podman uidmap passt nftables curl ca-certificates
@@ -445,6 +487,7 @@ EOF
 Description=hyyper-node (hyypervisor Gameserver-Node)
 After=network-online.target user@$uid.service
 Wants=network-online.target user@$uid.service
+RequiresMountsFor=$data
 
 [Service]
 User=$NODE_USER
@@ -674,6 +717,7 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now hyyper-update.path >/dev/null 2>&1 || say "Hinweis: Update-Dienst (hyyper-update.path) ließ sich nicht starten."
+  ensure_mounter
 }
 
 # Führt den Auftrag aus $UPD_DIR/request aus (aufgerufen von hyyper-update.service als root).
@@ -717,6 +761,177 @@ run_request() {
   done
   if [[ $rc -eq 0 ]]; then upd_status ok "Update abgeschlossen ($comps)"; else upd_status failed "Update fehlgeschlagen, Log: $UPD_LOG"; fi
   exit $rc
+}
+
+# ---- Mount-Dienst (Datastores über NFS/SMB) -----------------------------------------------------------
+# Der Node hängt nichts selbst ein. Für Datastores vom Typ NFS/SMB legt er eine Datei $UPD_DIR/mount-<ID> ab (Besitzer: Dienstbenutzer,
+# 0600, enthält bei SMB das Passwort). hyyper-mount.path startet dann hyyper-mount.service (root): "get-hyypervisor run-mounts".
+# Sicherheit wie beim Update-Auftrag: Datei zuerst per Umbenennen in einen Ordner nur für root, nur feste Schlüssel, jedes Feld streng
+# geprüft (dieselben Regeln wie im Portal und im Node), nie ausgeführt. Ziel ist immer $MNT_ROOT/<ID>; Optionen sind fest (nosuid,nodev).
+# Das Passwort steht nur kurz in einer Datei unter /run (0600) und wird nach dem Einhängen gelöscht. Ergebnis: $UPD_STATUS_DIR/mount-<ID>.status.
+MNT_ROOT="/mnt/hyypervisor"
+
+mnt_status() { # mnt_status <ID> <ok|failed> <Text>
+  [[ -d "$UPD_STATUS_DIR" ]] || return 0
+  local tmp; tmp=$(mktemp -p "$UPD_STATUS_DIR" .mstat.XXXXXX) || return 0
+  printf 'state=%s\nmessage=%s\ntime=%s\n' "$2" "${3//$'\n'/ }" "$(date +%s)" > "$tmp"
+  chgrp "$UPD_GROUP" "$tmp"; chmod 640 "$tmp"; mv -f "$tmp" "$UPD_STATUS_DIR/mount-$1.status"
+}
+
+mnt_valid_host() {
+  local h="$1" ip='^(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}$' name='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+  [[ ${#h} -ge 1 && ${#h} -le 253 ]] || return 1
+  if [[ "$h" =~ ^[0-9.]+$ ]]; then [[ "$h" =~ $ip ]]; return; fi
+  [[ "$h" =~ $name && "$h" != *..* ]]
+}
+
+# mnt_check <Art> <Host> <Freigabe> <Version> <Benutzer> <Domäne> <Passwort>: gibt bei einem Fehler den Grund aus.
+mnt_check() {
+  local kind="$1" host="$2" share="$3" ver="$4" user="$5" dom="$6" pass="$7"
+  local nfs_path='^/[A-Za-z0-9._@+/-]{0,200}$' smb_path='^[A-Za-z0-9._$ -]{1,80}(/[A-Za-z0-9._ -]{1,80}){0,8}$'
+  local nfs_ver='^(3|4|4\.0|4\.1|4\.2)?$' smb_ver='^(2\.0|2\.1|3\.0|3\.0\.2|3\.1\.1)?$'
+  local user_re='^[A-Za-z0-9._$@-]{1,64}$' dom_re='^[A-Za-z0-9._-]{0,64}$'
+  mnt_valid_host "$host" || { echo "ungültiger Host"; return 1; }
+  case "$kind" in
+    nfs)
+      [[ "$share" =~ $nfs_path && "$share" != *..* && "$share" != / ]] || { echo "ungültiger Export-Pfad"; return 1; }
+      [[ "$ver" =~ $nfs_ver ]] || { echo "ungültige NFS-Version"; return 1; }
+      [[ -z "$user$dom$pass" ]] || { echo "NFS hat keine Zugangsdaten"; return 1; } ;;
+    smb)
+      [[ "$share" =~ $smb_path && "$share" != *..* ]] || { echo "ungültige Freigabe"; return 1; }
+      [[ "$ver" =~ $smb_ver ]] || { echo "ungültige SMB-Version"; return 1; }
+      [[ "$user" =~ $user_re && "$dom" =~ $dom_re ]] || { echo "ungültiger Benutzer"; return 1; }
+      [[ ${#pass} -le 128 && "$pass" != *$'\r'* ]] || { echo "ungültiges Passwort"; return 1; } ;;
+    *) echo "unbekannte Art"; return 1 ;;
+  esac
+}
+
+# Schreibt die Zugangsdaten für mount.cifs in eine Datei nur für root (die Datei wird nach dem Einhängen gelöscht).
+mnt_cred_file() { # mnt_cred_file <Benutzer> <Domäne> <Passwort> → Pfad
+  local f; f=$(mktemp /run/.hyy-cred.XXXXXX) || return 1
+  chmod 600 "$f"
+  { printf 'username=%s\n' "$1"; [[ -z "$2" ]] || printf 'domain=%s\n' "$2"; printf 'password=%s\n' "$3"; } > "$f"
+  printf '%s' "$f"
+}
+
+mnt_do_mount() { # mnt_do_mount <ID> <Art> <Host> <Freigabe> <Version> <Benutzer> <Domäne> <Passwort>
+  local id="$1" kind="$2" host="$3" share="$4" ver="$5" user="$6" dom="$7" pass="$8" mp src cur out rc cred="" uid gid opts
+  mp="$MNT_ROOT/$id"
+  [[ -d "$MNT_ROOT" && ! -L "$MNT_ROOT" ]] || { mnt_status "$id" failed "$MNT_ROOT fehlt (get-hyypervisor update ausführen)"; return; }
+  [[ ! -L "$mp" ]] || { mnt_status "$id" failed "Einhängepunkt ist ein Symlink"; return; }
+  if [[ "$kind" == nfs ]]; then src="$host:$share"; else src="//$host/$share"; fi
+  if mountpoint -q "$mp" 2>/dev/null; then
+    cur=$(findmnt -n -o SOURCE --target "$mp" 2>/dev/null | head -1)
+    if [[ "$cur" == "$src" ]]; then mnt_status "$id" ok "bereits eingehängt"; return; fi
+    if ! out=$(umount "$mp" 2>&1); then mnt_status "$id" failed "Altes Einhängen lässt sich nicht lösen: ${out:0:300}"; return; fi
+  fi
+  if [[ "$kind" == nfs ]]; then
+    command -v mount.nfs >/dev/null 2>&1 || apt_install nfs-common >/dev/null 2>&1 || { mnt_status "$id" failed "Paket nfs-common ließ sich nicht installieren"; return; }
+  else
+    command -v mount.cifs >/dev/null 2>&1 || apt_install cifs-utils >/dev/null 2>&1 || { mnt_status "$id" failed "Paket cifs-utils ließ sich nicht installieren"; return; }
+  fi
+  mkdir -p "$mp" && chmod 755 "$mp" 2>/dev/null || true
+  if [[ "$kind" == nfs ]]; then
+    opts="nosuid,nodev,hard,timeo=100,retrans=3${ver:+,vers=$ver}"
+  else
+    uid=$(id -u "$NODE_USER" 2>/dev/null) || { mnt_status "$id" failed "Dienstbenutzer unbekannt"; return; }
+    gid=$(id -g "$NODE_USER")
+    cred=$(mnt_cred_file "$user" "$dom" "$pass") || { mnt_status "$id" failed "Zugangsdatei nicht anlegbar"; return; }
+    opts="credentials=$cred,uid=$uid,gid=$gid,file_mode=0660,dir_mode=0770,nosuid,nodev${ver:+,vers=$ver}"
+  fi
+  rc=0
+  out=$(timeout 30 mount -t "$([[ "$kind" == nfs ]] && echo nfs || echo cifs)" -o "$opts" -- "$src" "$mp" 2>&1) || rc=$?
+  [[ -z "$cred" ]] || rm -f -- "$cred"
+  if [[ $rc -ne 0 ]]; then
+    [[ $rc -ne 124 ]] || out="Zeitüberschreitung nach 30 s (Server erreichbar? Firewall?) $out"
+    rmdir "$mp" 2>/dev/null || true
+    mnt_status "$id" failed "Einhängen fehlgeschlagen: ${out:0:300}"
+    return
+  fi
+  mnt_status "$id" ok "eingehängt: $src"
+}
+
+mnt_do_umount() { # mnt_do_umount <ID>
+  local id="$1" mp="$MNT_ROOT/$1" out
+  if [[ -L "$mp" ]]; then mnt_status "$id" failed "Einhängepunkt ist ein Symlink"; return; fi
+  if mountpoint -q "$mp" 2>/dev/null; then
+    if ! out=$(timeout 60 umount "$mp" 2>&1); then mnt_status "$id" failed "Aushängen fehlgeschlagen (in Benutzung?): ${out:0:300}"; return; fi
+  fi
+  rmdir "$mp" 2>/dev/null || true
+  mnt_status "$id" ok "ausgehängt"
+}
+
+mnt_one() { # mnt_one <ID> <Datei>
+  local id="$1" src="$2" work f owner op="" kind="" host="" share="" ver="" user="" dom="" pass="" line k v why
+  work=$(mktemp -d -p "$UPD_STATUS_DIR" .mnt.XXXXXX) || return 0
+  if ! mv -T "$src" "$work/request" 2>/dev/null; then rm -rf "$work"; return 0; fi
+  f="$work/request"
+  if [[ -L "$f" || ! -f "$f" ]]; then rm -rf "$work"; mnt_status "$id" failed "ungültiger Auftrag"; return 0; fi
+  owner=$(stat -c %U "$f" 2>/dev/null || echo "?")
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    k="${line%%=*}"; v="${line#*=}"
+    case "$k" in op) op="$v" ;; kind) kind="$v" ;; host) host="$v" ;; share) share="$v" ;; version) ver="$v" ;; user) user="$v" ;; domain) dom="$v" ;; pass) pass="$v" ;; esac
+  done < <(head -c 4096 "$f")
+  rm -rf "$work"
+  if [[ "$owner" != "$NODE_USER" && "$owner" != root ]]; then mnt_status "$id" failed "Auftrag von unbekanntem Benutzer ($owner) abgelehnt"; return 0; fi
+  case "$op" in
+    umount) mnt_do_umount "$id" ;;
+    mount)
+      if ! why=$(mnt_check "$kind" "$host" "$share" "$ver" "$user" "$dom" "$pass"); then mnt_status "$id" failed "$why"; return 0; fi
+      mnt_do_mount "$id" "$kind" "$host" "$share" "$ver" "$user" "$dom" "$pass" ;;
+    *) mnt_status "$id" failed "ungültiger Auftrag" ;;
+  esac
+}
+
+# Bearbeitet alle Aufträge $UPD_DIR/mount-<ID> (aufgerufen von hyyper-mount.service als root).
+run_mounts() {
+  local f id
+  shopt -s nullglob
+  for f in "$UPD_DIR"/mount-*; do
+    id="${f##*/mount-}"
+    if [[ ! "$id" =~ ^[A-Za-z0-9-]{8,64}$ ]]; then rm -rf -- "$f"; continue; fi
+    mnt_one "$id" "$f"
+  done
+}
+
+# Richtet den Mount-Dienst ein (zusätzlich zum Update-Dienst; gleicher Einwurf-Ordner und gleiche Gruppe).
+ensure_mounter() {
+  have systemctl && [[ -d /run/systemd/system ]] || return 0
+  unit_exists hyyper-node || return 0
+  install -d -m 0755 "$MNT_ROOT"
+  mkdir -p /etc/systemd/system/hyyper-node.service.d
+  # Der Node darf in die eingehängten Datastores schreiben (ProtectSystem=strict); '-' = auch dann starten, wenn der Ordner fehlt.
+  cat > /etc/systemd/system/hyyper-node.service.d/mounts.conf <<EOF
+[Service]
+ReadWritePaths=-$MNT_ROOT
+EOF
+  cat > /etc/systemd/system/hyyper-mount.service <<EOF
+[Unit]
+Description=hyypervisor Datastores einhängen (NFS/SMB)
+After=network-online.target
+Wants=network-online.target
+# Aufträge kommen gehäuft (jede Verteilung der Datastores, jeder Node-Neustart): keine Startbegrenzung, sonst fällt der Dienst aus
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=$SELF run-mounts
+TimeoutStartSec=10min
+EOF
+  cat > /etc/systemd/system/hyyper-mount.path <<EOF
+[Unit]
+Description=hyypervisor Einhänge-Auftrag wartet
+StartLimitIntervalSec=0
+
+[Path]
+PathExistsGlob=$UPD_DIR/mount-*
+Unit=hyyper-mount.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now hyyper-mount.path >/dev/null 2>&1 || say "Hinweis: Mount-Dienst (hyyper-mount.path) ließ sich nicht starten."
 }
 
 # ---- Update / Entfernen / Status -----------------------------------------------------------------
@@ -812,6 +1027,7 @@ status() {
 case "$ACTION" in
   status) status; exit 0 ;;
   run-request) run_request ;;
+  run-mounts) run_mounts; exit 0 ;;
   backup-dir) set_backup_dir; exit 0 ;;
   uninstall) uninstall_comp "${COMP:-}"; exit 0 ;;
   update)
