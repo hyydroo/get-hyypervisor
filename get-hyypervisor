@@ -23,7 +23,7 @@ set -euo pipefail
 ORIG_ARGS=("$@")
 # SCRIPT_REV: bei jeder Änderung am Skript erhöhen. "update" holt sich vorher die neueste Fassung aus dem öffentlichen
 # Repo (hyydroo/get-hyypervisor), wenn deren Revision höher ist (HYY_NO_SELFUPDATE=1 schaltet das ab).
-SCRIPT_REV=9
+SCRIPT_REV=10
 SCRIPT_RAW="https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor"
 cd / 2>/dev/null || true   # ein gelöschtes Arbeitsverzeichnis (getcwd-Fehler) darf nichts stören
 
@@ -261,7 +261,7 @@ ensure_svc_user() {
 
 install_portal() {
   say "Installiere Portal (hyypervisor) …"
-  PKGS=(curl ca-certificates openssl); [[ -n "$BINARY" ]] || PKGS+=(podman)
+  PKGS=(curl ca-certificates openssl xorriso); [[ -n "$BINARY" ]] || PKGS+=(podman)
   apt_install "${PKGS[@]}"
   ensure_svc_user
   mkdir -p "$PORTAL_DATA" "$PORTAL_ENV_DIR"
@@ -944,6 +944,7 @@ update_portal() {
   fi
   local before; before=$(installed_version)
   say "Aktualisiere Portal (bisher $before) …"
+  have xorriso || apt_install xorriso || say "Hinweis: xorriso ließ sich nicht installieren (nötig für Installations-ISOs)."
   local tmp; tmp=$(mktemp)
   fetch_portal_binary "$tmp"
   install -m 755 "$tmp" "$BIN"; rm -f "$tmp"
