@@ -23,7 +23,7 @@ set -euo pipefail
 ORIG_ARGS=("$@")
 # SCRIPT_REV: bei jeder Änderung am Skript erhöhen. "update" holt sich vorher die neueste Fassung aus dem öffentlichen
 # Repo (hyydroo/get-hyypervisor), wenn deren Revision höher ist (HYY_NO_SELFUPDATE=1 schaltet das ab).
-SCRIPT_REV=7
+SCRIPT_REV=9
 SCRIPT_RAW="https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor"
 cd / 2>/dev/null || true   # ein gelöschtes Arbeitsverzeichnis (getcwd-Fehler) darf nichts stören
 
@@ -41,7 +41,7 @@ SVC_USER="hyypervisor"; SVC_UID="${HYY_UID:-2100}"; SVC_HOME="/var/lib/hyypervis
 PORTAL_USER="$SVC_USER"; PORTAL_DATA="$SVC_HOME"; PORTAL_ENV_DIR="/etc/hyypervisor"
 NODE_ENV_DIR="/etc/hyyper-node"; NODE_DEFAULT_DATA="/var/lib/hyyper-node"
 # Laufende Installationen behalten ihren Benutzer (vor Revision 5: hyyper / hyyper-forwarder); Neuinstallationen nutzen SVC_USER.
-unit_user() { sed -n 's/^User=//p' "/etc/systemd/system/$1.service" 2>/dev/null | head -1; }
+unit_user() { sed -n 's/^User=//p' "/etc/systemd/system/$1.service" 2>/dev/null | head -1 || true; }   # fehlt die Unit (frische VM), darf set -e nicht abbrechen
 NODE_USER="$(unit_user hyyper-node)"; NODE_USER="${NODE_USER:-$SVC_USER}"
 BIN="/usr/local/bin/hyypervisor"; SELF="/usr/local/bin/get-hyypervisor"
 
@@ -555,7 +555,8 @@ EOF
     systemctl daemon-reload
     systemctl enable hyyper-firewall.service >/dev/null
     systemctl restart hyyper-firewall.service || die "Firewall ließ sich nicht laden (nft mit cgroupv2 nötig). Log: journalctl -u hyyper-firewall -e"
-    nft list table inet hyyper 2>/dev/null | grep -q "user@$uid.service" || die "Firewall-Regel für die Gameserver fehlt."
+    # Ohne Pipe: "grep -q" beendet sich beim ersten Treffer, nft bekommt SIGPIPE und pipefail meldet einen Fehler (trat fast immer auf)
+    [[ "$(nft list table inet hyyper 2>/dev/null)" == *"user@$uid.service"* ]] || die "Firewall-Regel für die Gameserver fehlt."
     say "Firewall aktiv für die Gameserver-Container (Ausnahmen mit --allow CIDR)."
   fi
 
