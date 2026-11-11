@@ -12,6 +12,7 @@
 #   get-hyypervisor uninstall <Bauteil> Dienst entfernen (Daten bleiben)
 #   get-hyypervisor status              installierte Bauteile und Versionen
 #   get-hyypervisor backup-dir <DIR|off>  Fremdspeicher für Snapshot-Kopien des Nodes setzen/abschalten (z. B. NFS-Einhängepunkt)
+#   get-hyypervisor move-data <DIR> [--yes]  Daten eines vorhandenen Nodes auf eine andere Platte umziehen (kopiert, alter Ordner bleibt)
 #
 # Optionen portal/all: --image REF  --binary FILE  --listen ADDR  --db URL  --proxies CIDR
 # Optionen alle:       --uid N  feste UID/GID des Dienstbenutzers hyypervisor (Standard 2100, auf allen VMs gleich lassen)
@@ -23,7 +24,7 @@ set -euo pipefail
 ORIG_ARGS=("$@")
 # SCRIPT_REV: bei jeder Änderung am Skript erhöhen. "update" holt sich vorher die neueste Fassung aus dem öffentlichen
 # Repo (hyydroo/get-hyypervisor), wenn deren Revision höher ist (HYY_NO_SELFUPDATE=1 schaltet das ab).
-SCRIPT_REV=10
+SCRIPT_REV=11
 SCRIPT_RAW="https://raw.githubusercontent.com/hyydroo/get-hyypervisor/main/get-hyypervisor"
 cd / 2>/dev/null || true   # ein gelöschtes Arbeitsverzeichnis (getcwd-Fehler) darf nichts stören
 
@@ -33,7 +34,7 @@ PORTAL_DEFAULT="__PORTAL_URL__"          # vom Portal beim Ausliefern eingesetzt
 ACTION=""; COMP=""; COMPS=()
 IMAGE="ghcr.io/hyydroo/hyypervisor:latest"; BINARY=""; LISTEN=":8080"; DB=""; PROXIES=""
 PORTAL_URL="$PORTAL_DEFAULT"; TOKEN=""; NODE_DATA=""; BACKUP_DIR=""; FIREWALL=1; ALLOW=(); REGISTRY=""
-ARGS_GIVEN=0
+ARGS_GIVEN=0; ASSUME_YES=0
 
 # Ein Dienstbenutzer für Portal, Node und Forwarder (auch alles auf einer VM) mit fester UID/GID: Datastores und Cluster-Ordner
 # auf NFS brauchen auf allen VMs dieselbe Nummer, sonst gehören die Dateien auf der zweiten VM einem Fremden.
@@ -62,6 +63,7 @@ Debian 12/13 oder Ubuntu 22.04+, als root.
   get-hyypervisor uninstall <Bauteil> Dienst entfernen (Daten bleiben)
   get-hyypervisor status              installierte Bauteile und Versionen
   get-hyypervisor backup-dir <DIR|off>  Fremdspeicher für Snapshot-Kopien des Nodes setzen/abschalten (z. B. NFS-Einhängepunkt)
+  get-hyypervisor move-data <DIR> [--yes]  Daten eines vorhandenen Nodes auf eine andere Platte umziehen (kopiert, alter Ordner bleibt)
 
 Optionen portal/all: --image REF  --binary FILE  --listen ADDR  --db URL  --proxies CIDR
 Optionen node:       --portal URL  --token T (oder HYY_JOIN_TOKEN=…, oder Eingabe)  --data DIR  --backup-dir DIR  --allow CIDR  --no-firewall  --registry-login HOST
@@ -72,6 +74,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     install|update|uninstall|status|run-request|run-mounts) ACTION="$1"; shift ;;
     backup-dir) ACTION="backup-dir"; shift; if [[ $# -gt 0 && "$1" != -* ]]; then BACKUP_DIR="$1"; shift; fi ;;
+    move-data) ACTION="move-data"; shift; if [[ $# -gt 0 && "$1" != -* ]]; then NODE_DATA="$1"; shift; fi ;;
+    --yes) ASSUME_YES=1; shift ;;
     portal|node|forwarder) COMP="$1"; COMPS+=("$1"); shift ;;
     all) COMP="all"; COMPS+=(portal node); shift ;;
     agent) COMP="node"; COMPS+=(node); shift ;;
@@ -1014,6 +1018,82 @@ set_backup_dir() {
   if [[ -n "$new" ]]; then say "Fremdspeicher gesetzt: $new. Neue Snapshots werden dorthin kopiert (bestehende nicht automatisch)."; else say "Fremdspeicher abgeschaltet. Vorhandene Kopien bleiben liegen."; fi
 }
 
+# Node-Daten auf eine andere Platte umziehen: Serverdateien und Snapshots werden kopiert und geprüft, der alte Ordner bleibt
+# unverändert (Löschen nur von Hand, nachdem im Portal alles stimmt). Podman legt seine Images im neuen Ordner neu an (Container
+# sind kurzlebig, das Runtime-Image holt der Node selbst). Startet der Node danach nicht, wird der alte Stand wiederhergestellt.
+move_node_data() {
+  unit_exists hyyper-node || die "Hier ist kein hyyper-node installiert."
+  local old new uid home p need avail item ok
+  old=$(node_env HYY_NODE_DATA); old="${old%/}"; new="${NODE_DATA%/}"
+  [[ -n "$old" ]] || die "Keine Node-Konfiguration gefunden ($NODE_ENV_DIR/node.env)."
+  [[ -n "$new" ]] || die "Aufruf: get-hyypervisor move-data <neuer Ordner> [--yes]   (aktuell: $old)"
+  [[ "$new" != "$old" ]] || die "Der Node liegt schon in $new."
+  case "$new/" in "$old/"*) die "Der neue Ordner darf nicht im alten liegen." ;; esac
+  case "$old/" in "$new/"*) die "Der neue Ordner darf den alten nicht enthalten." ;; esac
+  case "$new/" in "$PORTAL_DATA/"*|"$PORTAL_ENV_DIR/"*) die "Der Node-Datenordner darf nicht im Portal-Ordner liegen ($new)." ;; esac
+  [[ -d "$old/servers" ]] || die "Im alten Ordner $old liegt kein Node ($old/servers fehlt)."
+  check_data_dir "$new"
+  [[ -z "$(find "$new" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit 2>/dev/null)" ]] || die "Der neue Ordner $new ist nicht leer."
+  have rsync || apt_install rsync
+  p="$new"; while [[ ! -e "$p" ]]; do p=$(dirname "$p"); done
+  need=$(du -sk "$old/servers" "$old/snapshots" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+  avail=$(df -k --output=avail "$p" | tail -1 | tr -d ' ')
+  (( avail > need + need / 10 + 1048576 )) || die "Zu wenig Platz in $new: frei ${avail} KB, gebraucht etwa ${need} KB plus Reserve für die Images."
+  if [[ $ASSUME_YES -ne 1 ]]; then
+    (exec </dev/tty) 2>/dev/null || die "Ohne Terminal bitte --yes angeben."
+    cat >/dev/tty <<EOF
+
+  Node-Daten umziehen:  $old  ->  $new   (etwa $((need / 1024)) MB)
+
+    - der Node und alle laufenden Gameserver werden gestoppt (Ausfall während des Kopierens),
+    - Serverdateien und Snapshots werden kopiert und verglichen,
+    - Podman lädt seine Images danach im neuen Ordner neu,
+    - der alte Ordner bleibt unverändert, bis du ihn selbst löschst.
+
+EOF
+    ask ok "Jetzt starten? [j/N]"; [[ "$ok" =~ ^[jJyY] ]] || die "Abgebrochen."
+  fi
+
+  uid=$(id -u "$NODE_USER"); home=$(getent passwd "$NODE_USER" | cut -d: -f6)
+  say "Stoppe den Node und alle Gameserver …"
+  systemctl stop hyyper-node.service
+  runuser -u "$NODE_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" podman stop --all --time 60 >/dev/null 2>&1 || true
+  install -d -m 750 -o "$NODE_USER" -g "$NODE_USER" "$new"
+  for item in servers snapshots agent-state.json; do
+    [[ -e "$old/$item" ]] || continue
+    say "Kopiere $item …"
+    rsync -aH --numeric-ids "$old/$item" "$new/" || { systemctl start hyyper-node.service || true; die "Kopieren von $item fehlgeschlagen. Der Node läuft weiter im alten Ordner, $new kann gelöscht werden."; }
+    [[ -z "$(rsync -aHni --numeric-ids "$old/$item" "$new/" | head -1)" ]] || { systemctl start hyyper-node.service || true; die "Kopie von $item weicht vom Original ab. Der Node läuft weiter im alten Ordner."; }
+  done
+  chown "$NODE_USER:$NODE_USER" "$new"; chmod 750 "$new"
+
+  local unit=/etc/systemd/system/hyyper-node.service conf="$home/.config/containers/storage.conf" f
+  for f in "$NODE_ENV_DIR/node.env" "$unit" "$conf"; do [[ ! -f "$f" ]] || cp -a "$f" "$f.bak-move"; done
+  sed -i "s#^HYY_NODE_DATA=.*#HYY_NODE_DATA=$new#" "$NODE_ENV_DIR/node.env"
+  sed -i "s#^RequiresMountsFor=.*#RequiresMountsFor=$new#; s#^ReadWritePaths=$old #ReadWritePaths=$new #" "$unit"
+  install -d -m 700 -o "$NODE_USER" -g "$NODE_USER" "$new/.local" "$new/.local/share" "$new/.local/share/containers"
+  printf '[storage]\ndriver = "overlay"\ngraphroot = "%s/.local/share/containers/storage"\n' "$new" > "$conf"
+  chown "$NODE_USER:$NODE_USER" "$conf"; chmod 600 "$conf"
+
+  systemctl daemon-reload
+  systemctl --user -M "$NODE_USER@" stop podman.service podman.socket >/dev/null 2>&1 || true
+  systemctl --user -M "$NODE_USER@" start podman.socket >/dev/null 2>&1 || true
+  systemctl start hyyper-node.service || true
+  sleep 5
+  if ! systemctl is-active --quiet hyyper-node.service; then
+    say "Der Node startet im neuen Ordner nicht – stelle den alten Stand wieder her …"
+    for f in "$NODE_ENV_DIR/node.env" "$unit" "$conf"; do [[ ! -f "$f.bak-move" ]] || mv -f "$f.bak-move" "$f"; done
+    systemctl daemon-reload
+    systemctl --user -M "$NODE_USER@" stop podman.service podman.socket >/dev/null 2>&1 || true
+    systemctl --user -M "$NODE_USER@" start podman.socket >/dev/null 2>&1 || true
+    systemctl start hyyper-node.service || true
+    die "Umzug zurückgenommen, der Node läuft wieder im alten Ordner $old. Log: journalctl -u hyyper-node -e"
+  fi
+  for f in "$NODE_ENV_DIR/node.env" "$unit" "$conf"; do rm -f "$f.bak-move"; done
+  say "Fertig. Der Node läuft jetzt aus $new. Im Portal prüfen (Node online, Server starten), das erste Starten lädt die Images neu."
+  say "Der alte Ordner $old ist unverändert. Wenn alles stimmt, Platz freigeben: rm -rf '$old/servers' '$old/snapshots' '$old/.local'"
+}
+
 status() {
   printf '  %-18s %s\n' "get-hyypervisor" "$([[ -x $SELF ]] && echo installiert || echo 'nicht auf dieser VM')"
   printf '  %-18s %s\n' "Binary" "$(installed_version)"
@@ -1031,6 +1111,7 @@ case "$ACTION" in
   run-request) run_request ;;
   run-mounts) run_mounts; exit 0 ;;
   backup-dir) set_backup_dir; exit 0 ;;
+  move-data) move_node_data; exit 0 ;;
   uninstall) uninstall_comp "${COMP:-}"; exit 0 ;;
   update)
     selfupdate_latest
